@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-Transport TSP</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Multi-Transport Traveling Salesman</h1>
+    <p class="tagline">
+      Compare total distance, journey time, and cost across ICE car, EV car, coach, train, and flight
+      for a tour visiting your chosen destinations.
+    </p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1. Destinations</h2>
+      <div class="row">
+        <input type="text" id="city-name" placeholder="City name (e.g. Edinburgh)" />
+        <button id="add-city">Add</button>
+        <button id="add-defaults" class="secondary">Load UK defaults</button>
+        <button id="clear-cities" class="secondary">Clear</button>
+      </div>
+      <p class="hint" id="geocode-hint">
+        Names are looked up in a built-in gazetteer, then (optionally) OpenStreetMap Nominatim or Google Geocoding.
+        If a name can't be resolved you'll be prompted for <code>lat,lon</code>.
+      </p>
+      <ul id="city-list" class="city-list"></ul>
+    </section>
+
+    <section class="card">
+      <h2>2. What to minimise</h2>
+      <div class="row">
+        <label><input type="radio" name="optimise" value="distance" /> Distance</label>
+        <label><input type="radio" name="optimise" value="time" checked /> Time</label>
+        <label><input type="radio" name="optimise" value="cost" /> Cost</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>3. Live data <span class="hint">(optional)</span></h2>
+
+      <details>
+        <summary>Google Maps (geocoding + driving/transit routing)</summary>
+        <div class="row">
+          <label>API key
+            <input type="password" id="google-key" autocomplete="off" placeholder="Google Maps key" />
+          </label>
+          <button id="load-google">Enable Google</button>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" id="use-google-geocode" /> Use Google for geocoding</label>
+          <label><input type="checkbox" id="use-google-routes" /> Use Google for driving + transit routing</label>
+        </div>
+        <p class="hint">
+          Loads the official Google Maps JS SDK with your key. The browser calls
+          <code>Geocoder</code> and <code>DistanceMatrixService</code> directly. Charges hit your
+          Google billing account; check your quotas.
+        </p>
+      </details>
+
+      <details>
+        <summary>Google Flights prices (via SerpAPI)</summary>
+        <div class="row">
+          <label>SerpAPI key
+            <input type="password" id="serpapi-key" autocomplete="off" placeholder="SerpAPI key" />
+          </label>
+          <label>Depart date
+            <input type="date" id="depart-date" />
+          </label>
+          <label><input type="checkbox" id="use-serpapi" /> Fetch live flight prices</label>
+        </div>
+        <p class="hint">
+          Google has no public Flights API; SerpAPI's <code>google_flights</code> engine is the
+          standard bridge. SerpAPI doesn't allow direct browser calls (no CORS), so requests usually
+          need a small proxy. If the call fails the program falls back to per-km defaults.
+        </p>
+      </details>
+
+      <details>
+        <summary>Per-km price overrides</summary>
+        <table id="price-table" class="price-table">
+          <thead>
+            <tr>
+              <th>Mode</th>
+              <th>£ / km</th>
+              <th>Avg km/h</th>
+              <th>Detour ×</th>
+              <th>Fixed £ / leg</th>
+              <th>Fixed h / leg</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p class="hint">Edit any cell. Values persist for this session only.</p>
+      </details>
+    </section>
+
+    <section class="card">
+      <button id="run" class="primary">Run TSP</button>
+      <div id="status" class="status"></div>
+    </section>
+
+    <section class="card" id="results-card" hidden>
+      <h2>Results</h2>
+      <p class="hint" id="results-meta"></p>
+      <table id="results-table" class="results-table">
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>Distance</th>
+            <th>Time</th>
+            <th>Cost</th>
+            <th>Tour</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    <p class="hint">
+      Offline-safe by default. To use Nominatim, Google, or SerpAPI you'll need to serve this
+      directory over HTTP (e.g. <code>python3 -m http.server</code>) so the browser allows
+      outbound requests.
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "_comment": "Override per-mode pricing here. Any field of Mode can be set. The scrapers block is opt-in via --enable-scrapers and refreshes per-km cost for fuel-driven modes from a URL + regex. Verify the URL + regex still match before relying on them; sites change layout often.",
+  "modes": {
+    "ICE car":  { "cost_per_km": 0.15, "avg_speed_kmh": 90,  "detour_factor": 1.30 },
+    "EV car":   { "cost_per_km": 0.05, "avg_speed_kmh": 90,  "detour_factor": 1.30 },
+    "Coach":    { "cost_per_km": 0.04, "avg_speed_kmh": 65,  "detour_factor": 1.35, "fixed_cost_per_leg": 1.0,  "fixed_time_per_leg_h": 0.25 },
+    "Train":    { "cost_per_km": 0.12, "avg_speed_kmh": 120, "detour_factor": 1.20, "fixed_cost_per_leg": 2.0,  "fixed_time_per_leg_h": 0.25 },
+    "Flight":   { "cost_per_km": 0.20, "avg_speed_kmh": 700, "detour_factor": 1.00, "fixed_cost_per_leg": 30.0, "fixed_time_per_leg_h": 2.50 }
+  },
+  "scrapers": {
+    "ICE car": {
+      "url": "https://www.globalpetrolprices.com/United-Kingdom/gasoline_prices/",
+      "regex": "U\\.K\\.[^0-9]*([0-9]+\\.[0-9]+)\\s*U\\.K\\. Pound",
+      "convert": "uk_pence_per_litre_to_gbp_per_km",
+      "_note": "Returns GBP/litre; converter assumes 7 L/100km. Edit converters in code if you want different assumptions."
+    },
+    "EV car": {
+      "url": "https://www.globalpetrolprices.com/United-Kingdom/electricity_prices/",
+      "regex": "U\\.K\\.[^0-9]*([0-9]+\\.[0-9]+)\\s*U\\.K\\. Pound",
+      "convert": "uk_pence_per_kwh_to_gbp_per_km",
+      "_note": "Returns GBP/kWh; converter assumes 0.18 kWh/km."
+    }
+  }
+}
