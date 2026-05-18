@@ -438,82 +438,193 @@ async function legCost(mode, a, b, router, prices) {
   return { distance, timeH, cost };
 }
 
-async function buildMatrix(cities, mode, router, prices, metric) {
-  const n = cities.length;
-  const m = Array.from({ length: n }, () => Array(n).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const { distance, timeH, cost } = await legCost(mode, cities[i], cities[j], router, prices);
-      const v = metric === 'distance' ? distance : metric === 'time' ? timeH : cost;
-      m[i][j] = m[j][i] = v;
+// ---------------------------------------------------------------------------
+// Scheduling: turn an ordered tour into a dated itinerary, check feasibility
+// ---------------------------------------------------------------------------
+
+function parseISODate(s) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function addDays(d, n) {
+  const out = new Date(d.getTime());
+  out.setUTCDate(out.getUTCDate() + n);
+  return out;
+}
+
+function fmtMonDay(d) {
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  return `${months[d.getUTCMonth()]}${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function isoDate(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function stayDaysFor(opts, name) {
+  return opts.stays && opts.stays[name] != null ? Number(opts.stays[name]) : opts.daysPerCity;
+}
+
+function* permutations(arr) {
+  if (arr.length <= 1) { yield arr.slice(); return; }
+  for (let i = 0; i < arr.length; i++) {
+    const rest = arr.slice(0, i).concat(arr.slice(i + 1));
+    for (const p of permutations(rest)) yield [arr[i], ...p];
+  }
+}
+
+async function computeSchedule(tour, cities, mode, router, prices, opts) {
+  const startName = opts.startCity || cities[tour[0]].name;
+  const isOpenPath = !!opts.endCity && opts.endCity !== startName;
+  let distance = 0, travelH = 0, cost = 0, elapsedH = 0;
+  const stops = [];
+
+  for (let i = 0; i < tour.length; i++) {
+    const c = cities[tour[i]];
+    const arriveH = elapsedH;
+    const stayH = stayDaysFor(opts, c.name) * 24;
+    const departH = arriveH + stayH;
+    let arriveD = null, departD = null;
+    if (opts.startDate) {
+      arriveD = addDays(opts.startDate, Math.floor(arriveH / 24));
+      const lastInclusive = stayH > 0 ? departH - 1e-9 : arriveH;
+      departD = addDays(opts.startDate, Math.floor(lastInclusive / 24));
+    }
+    stops.push({ name: c.name, arrive: arriveD, depart: departD });
+    elapsedH = departH;
+    if (i + 1 < tour.length) {
+      const nxt = cities[tour[i + 1]];
+      const leg = await legCost(mode, c, nxt, router, prices);
+      distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
+      elapsedH += leg.timeH;
     }
   }
-  return m;
-}
 
-function tourTotal(tour, matrix) {
-  let total = 0;
-  for (let i = 0; i < tour.length; i++) total += matrix[tour[i]][tour[(i + 1) % tour.length]];
-  return total;
-}
-
-function nearestNeighbor(start, matrix) {
-  const n = matrix.length;
-  const unvisited = new Set();
-  for (let i = 0; i < n; i++) if (i !== start) unvisited.add(i);
-  const tour = [start];
-  while (unvisited.size) {
-    const last = tour[tour.length - 1];
-    let best = -1, bestD = Infinity;
-    for (const j of unvisited) {
-      if (matrix[last][j] < bestD) { bestD = matrix[last][j]; best = j; }
-    }
-    tour.push(best);
-    unvisited.delete(best);
+  if (!isOpenPath && tour.length > 1) {
+    const first = cities[tour[0]], last = cities[tour[tour.length - 1]];
+    const leg = await legCost(mode, last, first, router, prices);
+    distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
+    elapsedH += leg.timeH;
   }
-  return tour;
-}
 
-function twoOpt(tour, matrix) {
-  const n = tour.length;
-  const best = tour.slice();
-  let improved = true;
-  while (improved) {
-    improved = false;
-    for (let i = 0; i < n - 1; i++) {
-      for (let j = i + 2; j < n; j++) {
-        if (i === 0 && j === n - 1) continue;
-        const a = best[i], b = best[i + 1], c = best[j], d = best[(j + 1) % n];
-        const delta = matrix[a][c] + matrix[b][d] - (matrix[a][b] + matrix[c][d]);
-        if (delta < -1e-9) {
-          let lo = i + 1, hi = j;
-          while (lo < hi) { const t = best[lo]; best[lo] = best[hi]; best[hi] = t; lo++; hi--; }
-          improved = true;
-        }
+  const totalDays = Math.max(1, Math.ceil(elapsedH / 24));
+
+  let reason = null;
+  if (opts.maxDays != null && totalDays > opts.maxDays) {
+    reason = `trip is ${totalDays}d, exceeds max ${opts.maxDays}d`;
+  } else if (opts.pins && Object.keys(opts.pins).length && !opts.startDate) {
+    reason = 'pins set but no startDate given';
+  } else if (opts.pins) {
+    const byName = Object.fromEntries(stops.map((s) => [s.name, s]));
+    for (const [pn, pd] of Object.entries(opts.pins)) {
+      const s = byName[pn];
+      if (!s) { reason = `pinned city ${pn} not in tour`; break; }
+      const pinT = pd.getTime();
+      if (pinT < s.arrive.getTime() || pinT > s.depart.getTime()) {
+        reason = `${pn} window ${isoDate(s.arrive)}..${isoDate(s.depart)} misses pinned ${isoDate(pd)}`;
+        break;
       }
     }
   }
-  return best;
+
+  return {
+    feasible: reason === null,
+    distance, travelH, cost, totalDays, stops, reason,
+  };
 }
 
-function solveTsp(matrix) {
-  const n = matrix.length;
-  let bestTour = null, bestLen = Infinity;
-  for (let s = 0; s < n; s++) {
-    const t = twoOpt(nearestNeighbor(s, matrix), matrix);
-    const len = tourTotal(t, matrix);
-    if (len < bestLen) { bestLen = len; bestTour = t; }
-  }
-  return bestTour;
+function pickObjective(sched, name) {
+  return name === 'distance' ? sched.distance : name === 'time' ? sched.travelH : sched.cost;
 }
 
-async function summariseTour(tour, cities, mode, router, prices) {
-  let distance = 0, timeH = 0, cost = 0;
-  for (let i = 0; i < tour.length; i++) {
-    const leg = await legCost(mode, cities[tour[i]], cities[tour[(i + 1) % tour.length]], router, prices);
-    distance += leg.distance; timeH += leg.timeH; cost += leg.cost;
+async function constrainedSearch(cities, mode, router, prices, opts, objective) {
+  const n = cities.length;
+  const nameToIdx = new Map(cities.map((c, i) => [c.name, i]));
+  const startIdx = nameToIdx.get(opts.startCity) ?? 0;
+  const startName = cities[startIdx].name;
+  const isOpenPath = !!opts.endCity && opts.endCity !== startName;
+  const endIdx = isOpenPath ? nameToIdx.get(opts.endCity) : null;
+  const middle = [];
+  for (let i = 0; i < n; i++) if (i !== startIdx && i !== endIdx) middle.push(i);
+
+  const assemble = (perm) => [startIdx, ...perm, ...(isOpenPath ? [endIdx] : [])];
+
+  let bestPerm = null, bestSched = null, lastReason = 'no feasible tour found';
+
+  const consider = (perm, sched) => {
+    if (!sched.feasible) { if (sched.reason) lastReason = sched.reason; return; }
+    if (!bestSched || pickObjective(sched, objective) < pickObjective(bestSched, objective)) {
+      bestPerm = perm.slice();
+      bestSched = sched;
+    }
+  };
+
+  if (factorial(middle.length) <= 40320) {
+    for (const perm of permutations(middle)) {
+      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts);
+      consider(perm, sched);
+    }
+  } else {
+    // heuristic: nearest-neighbor seeds + constrained 2-opt
+    const seeds = [await nnSeed(startIdx)];
+    for (let s = 0; s < 8; s++) seeds.push(shuffle(middle.slice(), s));
+    for (const seed of seeds) {
+      const { perm, sched } = await twoOptConstrained(seed);
+      consider(perm, sched);
+    }
   }
-  return { distance, timeH, cost };
+
+  async function nnSeed(start) {
+    const unv = new Set(middle);
+    const seq = [];
+    let last = start;
+    while (unv.size) {
+      let best = -1, bestVal = Infinity;
+      for (const j of unv) {
+        const leg = await legCost(mode, cities[last], cities[j], router, prices);
+        const v = objective === 'distance' ? leg.distance : objective === 'time' ? leg.timeH : leg.cost;
+        if (v < bestVal) { bestVal = v; best = j; }
+      }
+      seq.push(best); unv.delete(best); last = best;
+    }
+    return seq;
+  }
+
+  async function twoOptConstrained(perm) {
+    let cur = perm.slice();
+    let curSched = await computeSchedule(assemble(cur), cities, mode, router, prices, opts);
+    let curVal = curSched.feasible ? pickObjective(curSched, objective) : Infinity;
+    let improved = true;
+    while (improved) {
+      improved = false;
+      for (let i = 0; i < cur.length - 1; i++) {
+        for (let j = i + 1; j < cur.length; j++) {
+          const cand = cur.slice(0, i).concat(cur.slice(i, j + 1).reverse(), cur.slice(j + 1));
+          const candSched = await computeSchedule(assemble(cand), cities, mode, router, prices, opts);
+          if (!candSched.feasible) continue;
+          const v = pickObjective(candSched, objective);
+          if (v + 1e-9 < curVal) { cur = cand; curSched = candSched; curVal = v; improved = true; }
+        }
+      }
+    }
+    return { perm: cur, sched: curSched };
+  }
+
+  return { tour: bestPerm ? assemble(bestPerm) : null, sched: bestSched, reason: lastReason };
+}
+
+function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+
+function shuffle(arr, seed) {
+  // deterministic xorshift shuffle
+  let s = seed * 2654435761 >>> 0 || 1;
+  const rand = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 0x100000000; };
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +646,7 @@ function makePrompter() {
 async function promptCities(geocoder) {
   console.log('Enter destinations one per line. Blank line to finish.');
   const { ask, close } = makePrompter();
-  const cities = [];
+  let cities = [];
   try {
     while (true) {
       const raw = (await ask(`  city #${cities.length + 1}: `)).trim();
@@ -577,21 +688,41 @@ function fmtTime(hours) {
   return `${String(h).padStart(3)}h ${String(m).padStart(2, '0')}m`;
 }
 
-async function report(cities, modes, router, prices, optimiseFor) {
+function fmtStop(stop) {
+  if (!stop.arrive) return stop.name;
+  if (stop.arrive.getTime() === stop.depart.getTime()) return `${stop.name}(${fmtMonDay(stop.arrive)})`;
+  return `${stop.name}(${fmtMonDay(stop.arrive)}-${fmtMonDay(stop.depart)})`;
+}
+
+async function report(cities, modes, router, prices, optimiseFor, opts) {
+  const startName = opts.startCity || cities[0].name;
+  const isOpenPath = !!opts.endCity && opts.endCity !== startName;
   console.log(`Cities (${cities.length}): ${cities.map((c) => c.name).join(', ')}`);
+  let line = `Start: ${startName}` + (isOpenPath ? `   End: ${opts.endCity}` : '   (closed loop)');
+  if (opts.startDate) line += `   Start date: ${isoDate(opts.startDate)}`;
+  if (opts.maxDays != null) line += `   Max days: ${opts.maxDays}`;
+  console.log(line);
+  if (opts.pins && Object.keys(opts.pins).length) {
+    console.log('Pins: ' + Object.entries(opts.pins).map(([n, d]) => `${n}@${isoDate(d)}`).join(', '));
+  }
   console.log(`Optimising each tour for: ${optimiseFor}\n`);
-  const header = `${'Mode'.padEnd(10)} ${'Distance'.padStart(10)} ${'Time'.padStart(10)} ${'Cost'.padStart(10)}   Tour`;
+  const header = `${'Mode'.padEnd(10)} ${'Distance'.padStart(10)} ${'Travel'.padStart(10)} ${'Cost'.padStart(10)} ${'Days'.padStart(6)}   Itinerary`;
   console.log(header);
   console.log('-'.repeat(header.length));
   for (const mode of modes) {
-    const matrix = await buildMatrix(cities, mode, router, prices, optimiseFor);
-    const tour = solveTsp(matrix);
-    const s = await summariseTour(tour, cities, mode, router, prices);
-    const names = tour.concat([tour[0]]).map((i) => cities[i].name).join(' -> ');
-    const dist = `${s.distance.toFixed(0)}km`.padStart(10);
-    const time = fmtTime(s.timeH).padStart(10);
-    const cost = `£${s.cost.toFixed(2)}`.padStart(10);
-    console.log(`${mode.name.padEnd(10)} ${dist} ${time} ${cost}   ${names}`);
+    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, opts, optimiseFor);
+    if (!tour) {
+      const dash = (w) => '-'.padStart(w);
+      console.log(`${mode.name.padEnd(10)} ${dash(10)} ${dash(10)} ${dash(10)} ${dash(6)}   infeasible: ${reason}`);
+      continue;
+    }
+    let names = sched.stops.map(fmtStop).join(' -> ');
+    if (!isOpenPath) names += ` -> ${sched.stops[0].name}`;
+    const dist = `${sched.distance.toFixed(0)}km`.padStart(10);
+    const time = fmtTime(sched.travelH).padStart(10);
+    const cost = `£${sched.cost.toFixed(2)}`.padStart(10);
+    const days = `${sched.totalDays}d`.padStart(6);
+    console.log(`${mode.name.padEnd(10)} ${dist} ${time} ${cost} ${days}   ${names}`);
   }
 }
 
@@ -610,6 +741,8 @@ function parseArgs(argv) {
     amadeusSecret: process.env.AMADEUS_API_SECRET || null,
     amadeusProd: false,
     departDate: null,
+    startCity: null, endCity: null, startDate: null,
+    maxDays: null, daysPerCity: 1, stays: [], pins: [],
     optimise: 'time',
   };
   for (let i = 0; i < argv.length; i++) {
@@ -629,6 +762,13 @@ function parseArgs(argv) {
       case '--amadeus-secret': out.amadeusSecret = next(); break;
       case '--amadeus-prod': out.amadeusProd = true; break;
       case '--depart-date': out.departDate = next(); break;
+      case '--start': out.startCity = next(); break;
+      case '--end': out.endCity = next(); break;
+      case '--start-date': out.startDate = next(); break;
+      case '--max-days': out.maxDays = parseInt(next(), 10); break;
+      case '--days-per-city': out.daysPerCity = parseInt(next(), 10); break;
+      case '--stay': out.stays.push(next()); break;
+      case '--pin': out.pins.push(next()); break;
       case '--optimise': out.optimise = next(); break;
       case '-h': case '--help':
         console.log('see file header for usage');
@@ -708,7 +848,7 @@ async function main() {
     enableScrapers: args.enableScrapers,
   });
 
-  const cities = [];
+  let cities = [];
   if (args.citiesFile) cities.push(...loadCitiesFile(args.citiesFile));
   for (const name of args.city) {
     const c = await resolveCity(name, geocoder);
@@ -719,7 +859,40 @@ async function main() {
   if (!cities.length) cities.push(...DEFAULT_CITIES);
   if (cities.length < 2) { console.error('need at least 2 cities'); process.exit(2); }
 
-  await report(cities, prices.modes(), router, prices, args.optimise);
+  const stays = {};
+  for (const spec of args.stays) {
+    const eq = spec.indexOf('=');
+    if (eq < 0) { console.error(`--stay expects CITY=DAYS, got ${spec}`); process.exit(2); }
+    stays[spec.slice(0, eq).trim()] = parseInt(spec.slice(eq + 1), 10);
+  }
+  const pins = {};
+  for (const spec of args.pins) {
+    const eq = spec.indexOf('=');
+    if (eq < 0) { console.error(`--pin expects CITY=YYYY-MM-DD, got ${spec}`); process.exit(2); }
+    pins[spec.slice(0, eq).trim()] = parseISODate(spec.slice(eq + 1).trim());
+  }
+  const cityNames = new Set(cities.map((c) => c.name));
+  if (args.startCity && !cityNames.has(args.startCity)) { console.error(`--start ${args.startCity} not in cities`); process.exit(2); }
+  if (args.endCity && !cityNames.has(args.endCity)) { console.error(`--end ${args.endCity} not in cities`); process.exit(2); }
+  for (const n of [...Object.keys(stays), ...Object.keys(pins)]) {
+    if (!cityNames.has(n)) { console.error(`--stay/--pin city ${n} not in cities`); process.exit(2); }
+  }
+
+  if (args.startCity) {
+    const idx = cities.findIndex((c) => c.name === args.startCity);
+    if (idx > 0) cities = [cities[idx], ...cities.slice(0, idx), ...cities.slice(idx + 1)];
+  }
+
+  const opts = {
+    startDate: args.startDate ? parseISODate(args.startDate) : null,
+    daysPerCity: args.daysPerCity,
+    stays, pins,
+    maxDays: args.maxDays,
+    startCity: args.startCity || cities[0].name,
+    endCity: args.endCity,
+  };
+
+  await report(cities, prices.modes(), router, prices, args.optimise, opts);
 }
 
 if (require.main === module) {
@@ -727,7 +900,8 @@ if (require.main === module) {
 }
 
 module.exports = {
-  haversineKm, legCost, solveTsp, report,
+  haversineKm, legCost, computeSchedule, constrainedSearch, report,
+  parseISODate, addDays, isoDate, fmtMonDay,
   LocalGazetteer, NominatimGeocoder, GoogleGeocoder, FallbackGeocoder,
   HaversineRouter, GoogleRoutesRouter,
   ConfigPrices, SerpApiFlightPrices, AmadeusFlightPrices, ScrapedPerKmPrices, PriceStack,

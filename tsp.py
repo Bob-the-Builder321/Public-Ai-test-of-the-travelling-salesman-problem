@@ -27,14 +27,17 @@ CLI examples:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import os
+import random
 import sys
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 
@@ -535,78 +538,174 @@ def leg_cost(mode: Mode, a: City, b: City, router, prices) -> tuple[float, float
 
 
 # ---------------------------------------------------------------------------
-# TSP: nearest-neighbor + 2-opt over a chosen metric
+# Scheduling: turn an ordered tour into a dated itinerary and check feasibility
 # ---------------------------------------------------------------------------
 
 
-def build_matrix(cities: list[City], mode: Mode, router, prices, metric: str) -> list[list[float]]:
+@dataclass
+class ScheduleOpts:
+    """User-supplied scheduling constraints."""
+    start_date: Optional[date] = None
+    days_per_city: int = 1
+    stays: dict = field(default_factory=dict)   # city name -> int days
+    pins: dict = field(default_factory=dict)    # city name -> date
+    max_days: Optional[int] = None
+    start_city: Optional[str] = None            # name; defaults to first city
+    end_city: Optional[str] = None              # None or == start_city => closed loop
+
+
+@dataclass
+class Schedule:
+    feasible: bool
+    distance_km: float = 0.0
+    travel_h: float = 0.0
+    cost: float = 0.0
+    total_days: int = 0
+    stops: list = field(default_factory=list)   # [(name, arrive_date|None, depart_date|None)]
+    reason: Optional[str] = None
+
+
+def _stay_days(opts: ScheduleOpts, name: str) -> int:
+    return int(opts.stays.get(name, opts.days_per_city))
+
+
+def compute_schedule(tour: list, cities: list, mode: Mode,
+                     router, prices, opts: ScheduleOpts) -> Schedule:
+    is_cycle = (opts.end_city is None) or (opts.end_city == opts.start_city) or (opts.end_city == cities[tour[0]].name)
+
+    distance = travel_h = cost = 0.0
+    elapsed_h = 0.0
+    stops: list = []
+
+    for i, idx in enumerate(tour):
+        c = cities[idx]
+        arrive_h = elapsed_h
+        stay_h = _stay_days(opts, c.name) * 24
+        depart_h = arrive_h + stay_h
+
+        if opts.start_date is not None:
+            arrive_d = opts.start_date + timedelta(days=int(arrive_h // 24))
+            last_inclusive = depart_h - 1e-9 if stay_h > 0 else arrive_h
+            depart_d = opts.start_date + timedelta(days=int(last_inclusive // 24))
+        else:
+            arrive_d = depart_d = None
+        stops.append((c.name, arrive_d, depart_d))
+
+        elapsed_h = depart_h
+        if i + 1 < len(tour):
+            nxt = cities[tour[i + 1]]
+            d, t, k = leg_cost(mode, c, nxt, router, prices)
+            distance += d; travel_h += t; cost += k
+            elapsed_h += t
+
+    if is_cycle and len(tour) > 1:
+        first, last = cities[tour[0]], cities[tour[-1]]
+        d, t, k = leg_cost(mode, last, first, router, prices)
+        distance += d; travel_h += t; cost += k
+        elapsed_h += t
+
+    total_days = max(1, math.ceil(elapsed_h / 24))
+
+    reason = None
+    if opts.max_days is not None and total_days > opts.max_days:
+        reason = f"trip is {total_days}d, exceeds max {opts.max_days}d"
+    elif opts.pins and opts.start_date is None:
+        reason = "pins set but no --start-date given"
+    elif opts.pins:
+        by_name = {name: (arr, dep) for name, arr, dep in stops}
+        for pin_name, pin_date in opts.pins.items():
+            if pin_name not in by_name:
+                reason = f"pinned city {pin_name!r} not in tour"; break
+            arr, dep = by_name[pin_name]
+            if not (arr <= pin_date <= dep):
+                reason = (f"{pin_name} window {arr.isoformat()}..{dep.isoformat()} "
+                          f"misses pinned {pin_date.isoformat()}")
+                break
+
+    return Schedule(
+        feasible=(reason is None),
+        distance_km=distance, travel_h=travel_h, cost=cost,
+        total_days=total_days, stops=stops, reason=reason,
+    )
+
+
+def _objective(schedule: Schedule, name: str) -> float:
+    return {"distance": schedule.distance_km, "time": schedule.travel_h,
+            "cost": schedule.cost}[name]
+
+
+def constrained_search(cities: list, mode: Mode, router, prices,
+                       opts: ScheduleOpts, objective: str):
+    """Return (best_tour, best_schedule) or (None, reason_string)."""
     n = len(cities)
-    m = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            d, t, c = leg_cost(mode, cities[i], cities[j], router, prices)
-            v = {"distance": d, "time": t, "cost": c}[metric]
-            m[i][j] = m[j][i] = v
-    return m
+    name_to_idx = {c.name: i for i, c in enumerate(cities)}
+    start_idx = name_to_idx.get(opts.start_city, 0)
+    is_open_path = bool(opts.end_city) and opts.end_city != cities[start_idx].name
+    end_idx = name_to_idx.get(opts.end_city) if is_open_path else None
+    middle = [i for i in range(n) if i != start_idx and i != end_idx]
 
+    def assemble(perm: list) -> list:
+        return [start_idx] + list(perm) + ([end_idx] if is_open_path else [])
 
-def tour_total(tour, matrix):
-    return sum(matrix[tour[i]][tour[(i + 1) % len(tour)]] for i in range(len(tour)))
+    def score(perm):
+        return compute_schedule(assemble(perm), cities, mode, router, prices, opts)
 
+    last_reason = "no feasible tour found"
+    best_perm = None
+    best_sched: Optional[Schedule] = None
 
-def nearest_neighbor(start, matrix):
-    n = len(matrix)
-    unvisited = set(range(n))
-    unvisited.remove(start)
-    tour = [start]
-    while unvisited:
-        last = tour[-1]
-        nxt = min(unvisited, key=lambda j: matrix[last][j])
-        tour.append(nxt)
-        unvisited.remove(nxt)
-    return tour
+    def consider(perm, sched):
+        nonlocal best_perm, best_sched, last_reason
+        if not sched.feasible:
+            last_reason = sched.reason or last_reason
+            return
+        if best_sched is None or _objective(sched, objective) < _objective(best_sched, objective):
+            best_perm = list(perm)
+            best_sched = sched
 
+    if len(middle) <= 8:
+        for perm in itertools.permutations(middle):
+            consider(perm, score(perm))
+    else:
+        def nn_seed(seed_start):
+            unv = set(middle)
+            seq = []
+            last = seed_start
+            while unv:
+                key = {"distance": 0, "time": 1, "cost": 2}[objective]
+                nxt = min(unv, key=lambda j: leg_cost(mode, cities[last], cities[j], router, prices)[key])
+                seq.append(nxt); unv.remove(nxt); last = nxt
+            return seq
 
-def two_opt(tour, matrix):
-    n = len(tour)
-    best = tour[:]
-    improved = True
-    while improved:
-        improved = False
-        for i in range(n - 1):
-            for j in range(i + 2, n):
-                if i == 0 and j == n - 1:
-                    continue
-                a, b = best[i], best[i + 1]
-                c, d = best[j], best[(j + 1) % n]
-                delta = (matrix[a][c] + matrix[b][d]) - (matrix[a][b] + matrix[c][d])
-                if delta < -1e-9:
-                    best[i + 1:j + 1] = reversed(best[i + 1:j + 1])
-                    improved = True
-    return best
+        def two_opt(perm):
+            cur = perm[:]
+            cur_sched = score(cur)
+            cur_val = _objective(cur_sched, objective) if cur_sched.feasible else math.inf
+            improved = True
+            while improved:
+                improved = False
+                for i in range(len(cur) - 1):
+                    for j in range(i + 1, len(cur)):
+                        cand = cur[:i] + cur[i:j + 1][::-1] + cur[j + 1:]
+                        cand_sched = score(cand)
+                        if not cand_sched.feasible:
+                            continue
+                        v = _objective(cand_sched, objective)
+                        if v + 1e-9 < cur_val:
+                            cur, cur_sched, cur_val = cand, cand_sched, v
+                            improved = True
+            return cur, cur_sched
 
+        seeds = [nn_seed(start_idx)]
+        rng = random.Random(0)
+        seeds.extend(rng.sample(middle, len(middle)) for _ in range(8))
+        for seed in seeds:
+            perm, sched = two_opt(seed)
+            consider(perm, sched)
 
-def solve_tsp(matrix):
-    n = len(matrix)
-    best_tour, best_len = [], math.inf
-    for start in range(n):
-        tour = two_opt(nearest_neighbor(start, matrix), matrix)
-        length = tour_total(tour, matrix)
-        if length < best_len:
-            best_len, best_tour = length, tour
-    return best_tour
-
-
-def summarise_tour(tour, cities, mode, router, prices):
-    distance = time_h = cost = 0.0
-    for i in range(len(tour)):
-        a = cities[tour[i]]
-        b = cities[tour[(i + 1) % len(tour)]]
-        d, t, c = leg_cost(mode, a, b, router, prices)
-        distance += d
-        time_h += t
-        cost += c
-    return {"distance_km": distance, "time_h": time_h, "cost": cost}
+    if best_perm is None:
+        return None, last_reason
+    return assemble(best_perm), best_sched
 
 
 # ---------------------------------------------------------------------------
@@ -670,19 +769,39 @@ def fmt_time(hours: float) -> str:
     return f"{h:>3}h {m:02d}m"
 
 
-def report(cities: list[City], modes: list[Mode], router, prices, optimise_for: str) -> None:
+def _fmt_stop(name: str, arrive: Optional[date], depart: Optional[date]) -> str:
+    if arrive is None:
+        return name
+    if arrive == depart:
+        return f"{name}({arrive.strftime('%b%d')})"
+    return f"{name}({arrive.strftime('%b%d')}-{depart.strftime('%b%d')})"
+
+
+def report(cities: list[City], modes: list[Mode], router, prices,
+           optimise_for: str, opts: ScheduleOpts) -> None:
+    is_open_path = bool(opts.end_city) and opts.end_city != (opts.start_city or cities[0].name)
     print(f"Cities ({len(cities)}): " + ", ".join(c.name for c in cities))
+    print(f"Start: {opts.start_city or cities[0].name}"
+          + (f"   End: {opts.end_city}" if is_open_path else "   (closed loop)")
+          + (f"   Start date: {opts.start_date.isoformat()}" if opts.start_date else "")
+          + (f"   Max days: {opts.max_days}" if opts.max_days else ""))
+    if opts.pins:
+        print("Pins: " + ", ".join(f"{n}@{d.isoformat()}" for n, d in opts.pins.items()))
     print(f"Optimising each tour for: {optimise_for}\n")
-    header = f"{'Mode':<10} {'Distance':>10} {'Time':>10} {'Cost':>10}   Tour"
+    header = f"{'Mode':<10} {'Distance':>10} {'Travel':>10} {'Cost':>10} {'Days':>6}   Itinerary"
     print(header)
     print("-" * len(header))
     for mode in modes:
-        matrix = build_matrix(cities, mode, router, prices, optimise_for)
-        tour = solve_tsp(matrix)
-        s = summarise_tour(tour, cities, mode, router, prices)
-        names = " -> ".join(cities[i].name for i in tour + [tour[0]])
-        print(f"{mode.name:<10} {s['distance_km']:>8.0f}km {fmt_time(s['time_h']):>10} "
-              f"£{s['cost']:>8.2f}   {names}")
+        tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for)
+        if tour is None:
+            print(f"{mode.name:<10} {'-':>10} {'-':>10} {'-':>10} {'-':>6}   infeasible: {result}")
+            continue
+        sched: Schedule = result
+        names = " -> ".join(_fmt_stop(*s) for s in sched.stops)
+        if not is_open_path:
+            names += f" -> {sched.stops[0][0]}"
+        print(f"{mode.name:<10} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
+              f"£{sched.cost:>8.2f} {sched.total_days:>5}d   {names}")
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +891,21 @@ def main():
                       help="use Amadeus production endpoint instead of test")
     prov.add_argument("--depart-date", help="YYYY-MM-DD for flight quotes (required with flight API keys)")
 
+    sched = p.add_argument_group("schedule")
+    sched.add_argument("--start", dest="start_city", help="city to start from (default: first city)")
+    sched.add_argument("--end", dest="end_city",
+                       help="city to end at (default: same as start = closed loop)")
+    sched.add_argument("--start-date", dest="start_date",
+                       help="YYYY-MM-DD; first day of the trip (needed for pins and itinerary dates)")
+    sched.add_argument("--max-days", type=int, help="reject tours longer than this many days")
+    sched.add_argument("--days-per-city", type=int, default=1, help="default stay per city (days)")
+    sched.add_argument("--stay", action="append", default=[],
+                       metavar="CITY=DAYS",
+                       help="override stay for a specific city (repeatable)")
+    sched.add_argument("--pin", action="append", default=[],
+                       metavar="CITY=YYYY-MM-DD",
+                       help="require being in CITY on the given date (repeatable)")
+
     p.add_argument("--optimise", choices=["distance", "time", "cost"], default="time")
     args = p.parse_args()
 
@@ -805,7 +939,47 @@ def main():
         print("need at least 2 cities", file=sys.stderr)
         sys.exit(2)
 
-    report(cities, DEFAULT_MODES, router, prices, args.optimise)
+    stays: dict = {}
+    for spec in args.stay:
+        if "=" not in spec:
+            print(f"--stay expects CITY=DAYS, got {spec!r}", file=sys.stderr); sys.exit(2)
+        name, days = spec.split("=", 1)
+        stays[name.strip()] = int(days)
+
+    pins: dict = {}
+    for spec in args.pin:
+        if "=" not in spec:
+            print(f"--pin expects CITY=YYYY-MM-DD, got {spec!r}", file=sys.stderr); sys.exit(2)
+        name, d = spec.split("=", 1)
+        pins[name.strip()] = datetime.strptime(d.strip(), "%Y-%m-%d").date()
+
+    start_date = (datetime.strptime(args.start_date, "%Y-%m-%d").date()
+                  if args.start_date else None)
+
+    city_names = {c.name for c in cities}
+    if args.start_city and args.start_city not in city_names:
+        print(f"--start {args.start_city!r} not in cities", file=sys.stderr); sys.exit(2)
+    if args.end_city and args.end_city not in city_names:
+        print(f"--end {args.end_city!r} not in cities", file=sys.stderr); sys.exit(2)
+    for n in list(stays) + list(pins):
+        if n not in city_names:
+            print(f"--stay/--pin city {n!r} not in cities", file=sys.stderr); sys.exit(2)
+
+    if args.start_city:
+        cities = [next(c for c in cities if c.name == args.start_city)] + \
+                 [c for c in cities if c.name != args.start_city]
+
+    opts = ScheduleOpts(
+        start_date=start_date,
+        days_per_city=args.days_per_city,
+        stays=stays,
+        pins=pins,
+        max_days=args.max_days,
+        start_city=args.start_city or cities[0].name,
+        end_city=args.end_city,
+    )
+
+    report(cities, DEFAULT_MODES, router, prices, args.optimise, opts)
 
 
 if __name__ == "__main__":

@@ -327,74 +327,148 @@ async function legCost(mode, a, b, router, prices) {
   return { distance, timeH, cost };
 }
 
-async function buildMatrix(cities, mode, router, prices, metric) {
-  const n = cities.length;
-  const m = Array.from({ length: n }, () => Array(n).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const { distance, timeH, cost } = await legCost(mode, cities[i], cities[j], router, prices);
-      const v = metric === 'distance' ? distance : metric === 'time' ? timeH : cost;
-      m[i][j] = m[j][i] = v;
+// ---------------------------------------------------------------------------
+// Scheduling helpers (mirror tsp.js / tsp.py)
+// ---------------------------------------------------------------------------
+
+function parseISODate(s) {
+  if (!s) return null;
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+function addDays(d, n) { const x = new Date(d.getTime()); x.setUTCDate(x.getUTCDate() + n); return x; }
+function fmtMonDay(d) {
+  const M = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${M[d.getUTCMonth()]} ${d.getUTCDate()}`;
+}
+function isoDate(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+}
+
+function* permutations(arr) {
+  if (arr.length <= 1) { yield arr.slice(); return; }
+  for (let i = 0; i < arr.length; i++) {
+    const rest = arr.slice(0, i).concat(arr.slice(i + 1));
+    for (const p of permutations(rest)) yield [arr[i], ...p];
+  }
+}
+function factorial(n) { let r = 1; for (let i = 2; i <= n; i++) r *= i; return r; }
+
+function stayDaysFor(opts, name) {
+  return opts.stays && opts.stays[name] != null ? Number(opts.stays[name]) : opts.daysPerCity;
+}
+
+async function computeSchedule(tour, cities, mode, router, prices, opts) {
+  const startName = opts.startCity || cities[tour[0]].name;
+  const isOpenPath = !!opts.endCity && opts.endCity !== startName;
+  let distance = 0, travelH = 0, cost = 0, elapsedH = 0;
+  const stops = [];
+  for (let i = 0; i < tour.length; i++) {
+    const c = cities[tour[i]];
+    const arriveH = elapsedH;
+    const stayH = stayDaysFor(opts, c.name) * 24;
+    const departH = arriveH + stayH;
+    let arrive = null, depart = null;
+    if (opts.startDate) {
+      arrive = addDays(opts.startDate, Math.floor(arriveH / 24));
+      const lastInclusive = stayH > 0 ? departH - 1e-9 : arriveH;
+      depart = addDays(opts.startDate, Math.floor(lastInclusive / 24));
+    }
+    stops.push({ name: c.name, arrive, depart });
+    elapsedH = departH;
+    if (i + 1 < tour.length) {
+      const leg = await legCost(mode, c, cities[tour[i + 1]], router, prices);
+      distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
+      elapsedH += leg.timeH;
     }
   }
-  return m;
-}
-
-function tourTotal(t, M) { let s = 0; for (let i = 0; i < t.length; i++) s += M[t[i]][t[(i + 1) % t.length]]; return s; }
-
-function nearestNeighbor(start, M) {
-  const n = M.length;
-  const u = new Set();
-  for (let i = 0; i < n; i++) if (i !== start) u.add(i);
-  const tour = [start];
-  while (u.size) {
-    const last = tour[tour.length - 1];
-    let best = -1, bestD = Infinity;
-    for (const j of u) if (M[last][j] < bestD) { bestD = M[last][j]; best = j; }
-    tour.push(best); u.delete(best);
+  if (!isOpenPath && tour.length > 1) {
+    const leg = await legCost(mode, cities[tour[tour.length - 1]], cities[tour[0]], router, prices);
+    distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
+    elapsedH += leg.timeH;
   }
-  return tour;
-}
-
-function twoOpt(tour, M) {
-  const n = tour.length;
-  const best = tour.slice();
-  let improved = true;
-  while (improved) {
-    improved = false;
-    for (let i = 0; i < n - 1; i++) {
-      for (let j = i + 2; j < n; j++) {
-        if (i === 0 && j === n - 1) continue;
-        const a = best[i], b = best[i + 1], c = best[j], d = best[(j + 1) % n];
-        const delta = M[a][c] + M[b][d] - (M[a][b] + M[c][d]);
-        if (delta < -1e-9) {
-          let lo = i + 1, hi = j;
-          while (lo < hi) { const t = best[lo]; best[lo] = best[hi]; best[hi] = t; lo++; hi--; }
-          improved = true;
-        }
+  const totalDays = Math.max(1, Math.ceil(elapsedH / 24));
+  let reason = null;
+  if (opts.maxDays != null && totalDays > opts.maxDays) {
+    reason = `trip is ${totalDays}d, exceeds max ${opts.maxDays}d`;
+  } else if (opts.pins && Object.keys(opts.pins).length && !opts.startDate) {
+    reason = 'pins set but no start date';
+  } else if (opts.pins) {
+    const byName = Object.fromEntries(stops.map((s) => [s.name, s]));
+    for (const [pn, pd] of Object.entries(opts.pins)) {
+      const s = byName[pn];
+      if (!s) { reason = `pinned city ${pn} not in tour`; break; }
+      const t = pd.getTime();
+      if (t < s.arrive.getTime() || t > s.depart.getTime()) {
+        reason = `${pn} window ${isoDate(s.arrive)}..${isoDate(s.depart)} misses pinned ${isoDate(pd)}`;
+        break;
       }
     }
   }
-  return best;
+  return { feasible: reason === null, distance, travelH, cost, totalDays, stops, reason };
 }
 
-function solveTsp(M) {
-  let bestTour = null, bestLen = Infinity;
-  for (let s = 0; s < M.length; s++) {
-    const t = twoOpt(nearestNeighbor(s, M), M);
-    const len = tourTotal(t, M);
-    if (len < bestLen) { bestLen = len; bestTour = t; }
+function pickObjective(s, m) { return m === 'distance' ? s.distance : m === 'time' ? s.travelH : s.cost; }
+
+async function constrainedSearch(cities, mode, router, prices, opts, objective) {
+  const n = cities.length;
+  const idxOf = new Map(cities.map((c, i) => [c.name, i]));
+  const startIdx = idxOf.get(opts.startCity) ?? 0;
+  const startName = cities[startIdx].name;
+  const isOpenPath = !!opts.endCity && opts.endCity !== startName;
+  const endIdx = isOpenPath ? idxOf.get(opts.endCity) : null;
+  const middle = [];
+  for (let i = 0; i < n; i++) if (i !== startIdx && i !== endIdx) middle.push(i);
+  const assemble = (perm) => [startIdx, ...perm, ...(isOpenPath ? [endIdx] : [])];
+
+  let bestPerm = null, bestSched = null, lastReason = 'no feasible tour';
+  const consider = (perm, sched) => {
+    if (!sched.feasible) { if (sched.reason) lastReason = sched.reason; return; }
+    if (!bestSched || pickObjective(sched, objective) < pickObjective(bestSched, objective)) {
+      bestPerm = perm.slice();
+      bestSched = sched;
+    }
+  };
+
+  if (factorial(middle.length) <= 40320) {
+    for (const perm of permutations(middle)) {
+      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts);
+      consider(perm, sched);
+    }
+  } else {
+    const seeds = [middle.slice()];
+    for (let s = 1; s <= 6; s++) seeds.push(shuffle(middle.slice(), s));
+    for (const seed of seeds) {
+      let cur = seed.slice();
+      let curS = await computeSchedule(assemble(cur), cities, mode, router, prices, opts);
+      let curV = curS.feasible ? pickObjective(curS, objective) : Infinity;
+      let improved = true;
+      while (improved) {
+        improved = false;
+        for (let i = 0; i < cur.length - 1; i++) {
+          for (let j = i + 1; j < cur.length; j++) {
+            const cand = cur.slice(0, i).concat(cur.slice(i, j + 1).reverse(), cur.slice(j + 1));
+            const cs = await computeSchedule(assemble(cand), cities, mode, router, prices, opts);
+            if (!cs.feasible) continue;
+            const v = pickObjective(cs, objective);
+            if (v + 1e-9 < curV) { cur = cand; curS = cs; curV = v; improved = true; }
+          }
+        }
+      }
+      consider(cur, curS);
+    }
   }
-  return bestTour;
+  return { tour: bestPerm ? assemble(bestPerm) : null, sched: bestSched, reason: lastReason };
 }
 
-async function summariseTour(tour, cities, mode, router, prices) {
-  let distance = 0, timeH = 0, cost = 0;
-  for (let i = 0; i < tour.length; i++) {
-    const leg = await legCost(mode, cities[tour[i]], cities[tour[(i + 1) % tour.length]], router, prices);
-    distance += leg.distance; timeH += leg.timeH; cost += leg.cost;
+function shuffle(arr, seed) {
+  let s = (seed * 2654435761) >>> 0 || 1;
+  const rand = () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 0x100000000; };
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
   }
-  return { distance, timeH, cost };
+  return arr;
 }
 
 function fmtTime(hours) {
@@ -429,6 +503,7 @@ function renderCities() {
   ul.innerHTML = '';
   if (!state.cities.length) {
     ul.innerHTML = '<li class="hint" style="background:transparent;border:0;">No destinations yet. Add some above, or click "Load UK defaults".</li>';
+    refreshCityPickers();
     return;
   }
   state.cities.forEach((c, i) => {
@@ -436,13 +511,56 @@ function renderCities() {
     li.innerHTML = `
       <span class="name"></span>
       <span class="coords"></span>
+      <label class="hint">stay <input type="number" min="0" class="stay" style="width:5ch"></label>
+      <label class="hint">pin <input type="date" class="pin"></label>
       <button title="Remove" aria-label="Remove">×</button>
     `;
     li.querySelector('.name').textContent = c.name;
     li.querySelector('.coords').textContent = `${c.lat.toFixed(4)}, ${c.lon.toFixed(4)}`;
+    const stayInp = li.querySelector('.stay');
+    stayInp.value = c.stayDays != null ? c.stayDays : '';
+    stayInp.placeholder = String(currentDaysPerCity());
+    stayInp.addEventListener('change', () => {
+      c.stayDays = stayInp.value === '' ? null : parseInt(stayInp.value, 10);
+    });
+    const pinInp = li.querySelector('.pin');
+    pinInp.value = c.pinDate || '';
+    pinInp.addEventListener('change', () => { c.pinDate = pinInp.value || null; });
     li.querySelector('button').onclick = () => { state.cities.splice(i, 1); renderCities(); };
     ul.appendChild(li);
   });
+  refreshCityPickers();
+}
+
+function currentDaysPerCity() {
+  const v = parseInt($('days-per-city').value, 10);
+  return Number.isFinite(v) && v >= 0 ? v : 1;
+}
+
+function refreshCityPickers() {
+  const startSel = $('start-city');
+  const endSel = $('end-city');
+  const prevStart = startSel.value;
+  const prevEnd = endSel.value;
+  startSel.innerHTML = '';
+  if (!state.cities.length) {
+    startSel.innerHTML = '<option value="">(no cities)</option>';
+  } else {
+    for (const c of state.cities) {
+      const o = document.createElement('option');
+      o.value = c.name; o.textContent = c.name;
+      startSel.appendChild(o);
+    }
+    startSel.value = state.cities.some((c) => c.name === prevStart) ? prevStart : state.cities[0].name;
+  }
+  // end keeps "(return to start)" plus the same list
+  endSel.innerHTML = '<option value="">(return to start)</option>';
+  for (const c of state.cities) {
+    const o = document.createElement('option');
+    o.value = c.name; o.textContent = c.name;
+    endSel.appendChild(o);
+  }
+  endSel.value = state.cities.some((c) => c.name === prevEnd) ? prevEnd : '';
 }
 
 function renderPriceTable() {
@@ -512,7 +630,7 @@ async function addCity(rawName) {
   setStatus(`Looking up "${name}"…`);
   const r = await activeGeocoder().geocode(name);
   if (r) {
-    state.cities.push({ name, lat: r.lat, lon: r.lon });
+    state.cities.push({ name, lat: r.lat, lon: r.lon, stayDays: null, pinDate: null });
     renderCities();
     setStatus(`Added ${name}.`, 'ok');
   } else {
@@ -520,7 +638,7 @@ async function addCity(rawName) {
     if (!manual) { setStatus(`Skipped ${name}.`); return; }
     const parts = manual.split(',').map((s) => parseFloat(s.trim()));
     if (parts.length === 2 && parts.every(Number.isFinite)) {
-      state.cities.push({ name, lat: parts[0], lon: parts[1] });
+      state.cities.push({ name, lat: parts[0], lon: parts[1], stayDays: null, pinDate: null });
       renderCities();
       setStatus(`Added ${name} (manual coordinates).`, 'ok');
     } else {
@@ -548,24 +666,61 @@ function loadGoogleMaps(key) {
   });
 }
 
+function collectScheduleOpts() {
+  const startCity = $('start-city').value || (state.cities[0] && state.cities[0].name) || null;
+  const endRaw = $('end-city').value || null;
+  const endCity = endRaw && endRaw !== startCity ? endRaw : null;
+  const startDate = parseISODate($('trip-start-date').value);
+  const maxDaysRaw = parseInt($('max-days').value, 10);
+  const maxDays = Number.isFinite(maxDaysRaw) ? maxDaysRaw : null;
+  const daysPerCity = currentDaysPerCity();
+  const stays = {};
+  const pins = {};
+  for (const c of state.cities) {
+    if (c.stayDays != null) stays[c.name] = c.stayDays;
+    if (c.pinDate) {
+      const d = parseISODate(c.pinDate);
+      if (d) pins[c.name] = d;
+    }
+  }
+  return { startCity, endCity, startDate, maxDays, daysPerCity, stays, pins };
+}
+
 async function run() {
   if (state.cities.length < 2) { setStatus('Need at least 2 destinations.', 'error'); return; }
   const optimise = document.querySelector('input[name="optimise"]:checked').value;
   const router = activeRouter();
   const prices = activePrices();
+  const opts = collectScheduleOpts();
+  if (Object.keys(opts.pins).length && !opts.startDate) {
+    setStatus('Pinned dates require a trip Start date.', 'error');
+    return;
+  }
+  // Move start city to position 0 so closed-loop schedules start there.
+  let cities = state.cities;
+  if (opts.startCity && cities[0].name !== opts.startCity) {
+    const idx = cities.findIndex((c) => c.name === opts.startCity);
+    if (idx > 0) cities = [cities[idx], ...cities.slice(0, idx), ...cities.slice(idx + 1)];
+  }
 
   $('run').disabled = true;
   setStatus('Computing tours…');
   try {
     const rows = [];
     for (const mode of prices.modes()) {
-      const M = await buildMatrix(state.cities, mode, router, prices, optimise);
-      const tour = solveTsp(M);
-      const s = await summariseTour(tour, state.cities, mode, router, prices);
-      const names = tour.concat([tour[0]]).map((i) => state.cities[i].name).join(' → ');
-      rows.push({ mode: mode.name, distance: s.distance, timeH: s.timeH, cost: s.cost, names });
+      const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, opts, optimise);
+      if (!tour) { rows.push({ mode: mode.name, infeasible: reason }); continue; }
+      rows.push({
+        mode: mode.name,
+        distance: sched.distance,
+        timeH: sched.travelH,
+        cost: sched.cost,
+        days: sched.totalDays,
+        stops: sched.stops,
+        isOpenPath: !!opts.endCity && opts.endCity !== opts.startCity,
+      });
     }
-    renderResults(rows, optimise);
+    renderResults(rows, optimise, opts);
     setStatus(`Done. Optimised for ${optimise}.`, 'ok');
   } catch (e) {
     console.error(e);
@@ -575,38 +730,55 @@ async function run() {
   }
 }
 
-function renderResults(rows, optimise) {
+function renderResults(rows, optimise, opts) {
   $('results-card').hidden = false;
+  const startName = opts.startCity || (state.cities[0] && state.cities[0].name) || '';
+  const endLabel = opts.endCity && opts.endCity !== startName ? `end ${opts.endCity}` : 'closed loop';
   $('results-meta').textContent =
-    `${state.cities.length} destinations · tour minimises ${optimise} per mode · prices in GBP.`;
+    `${state.cities.length} destinations · start ${startName} · ${endLabel}` +
+    (opts.startDate ? ` · from ${isoDate(opts.startDate)}` : '') +
+    (opts.maxDays != null ? ` · max ${opts.maxDays}d` : '') +
+    ` · minimises ${optimise} · prices in GBP.`;
 
-  const winners = {
-    distance: Math.min(...rows.map((r) => r.distance)),
-    time:     Math.min(...rows.map((r) => r.timeH)),
-    cost:     Math.min(...rows.map((r) => r.cost)),
-  };
+  const feasible = rows.filter((r) => !r.infeasible);
+  const winners = feasible.length
+    ? {
+        distance: Math.min(...feasible.map((r) => r.distance)),
+        time:     Math.min(...feasible.map((r) => r.timeH)),
+        cost:     Math.min(...feasible.map((r) => r.cost)),
+      }
+    : null;
 
   const tbody = $('results-table').querySelector('tbody');
   tbody.innerHTML = '';
   for (const r of rows) {
     const tr = document.createElement('tr');
-    if (
+    if (r.infeasible) {
+      tr.innerHTML = '<td></td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="tour"></td>';
+      tr.children[0].textContent = r.mode;
+      tr.children[5].textContent = `infeasible: ${r.infeasible}`;
+      tbody.appendChild(tr);
+      continue;
+    }
+    if (winners && (
       (optimise === 'distance' && r.distance === winners.distance) ||
       (optimise === 'time' && r.timeH === winners.time) ||
       (optimise === 'cost' && r.cost === winners.cost)
-    ) tr.classList.add('best');
-    tr.innerHTML = `
-      <td></td>
-      <td class="num"></td>
-      <td class="num"></td>
-      <td class="num"></td>
-      <td class="tour"></td>
-    `;
+    )) tr.classList.add('best');
+    let itinerary = r.stops.map((s) => {
+      if (!s.arrive) return s.name;
+      const a = fmtMonDay(s.arrive);
+      const d = fmtMonDay(s.depart);
+      return a === d ? `${s.name} (${a})` : `${s.name} (${a}–${d})`;
+    }).join(' → ');
+    if (!r.isOpenPath) itinerary += ` → ${r.stops[0].name}`;
+    tr.innerHTML = '<td></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="tour"></td>';
     tr.children[0].textContent = r.mode;
     tr.children[1].textContent = `${r.distance.toFixed(0)} km`;
     tr.children[2].textContent = fmtTime(r.timeH);
     tr.children[3].textContent = `£${r.cost.toFixed(2)}`;
-    tr.children[4].textContent = r.names;
+    tr.children[4].textContent = `${r.days}d`;
+    tr.children[5].textContent = itinerary;
     tbody.appendChild(tr);
   }
 }
@@ -627,10 +799,11 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Enter') { e.preventDefault(); $('add-city').click(); }
   });
   $('add-defaults').addEventListener('click', () => {
-    state.cities = DEFAULT_CITIES.map((c) => ({ ...c }));
+    state.cities = DEFAULT_CITIES.map((c) => ({ ...c, stayDays: null, pinDate: null }));
     renderCities();
     setStatus('Loaded UK defaults.', 'ok');
   });
+  $('days-per-city').addEventListener('change', renderCities);
   $('clear-cities').addEventListener('click', () => {
     state.cities = [];
     renderCities();

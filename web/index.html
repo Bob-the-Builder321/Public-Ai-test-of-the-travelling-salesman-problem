@@ -32,7 +32,34 @@
     </section>
 
     <section class="card">
-      <h2>2. What to minimise</h2>
+      <h2>2. Schedule <span class="hint">(optional but enables date-aware results)</span></h2>
+      <div class="row">
+        <label>Start city
+          <select id="start-city"></select>
+        </label>
+        <label>End city
+          <select id="end-city">
+            <option value="">(return to start)</option>
+          </select>
+        </label>
+        <label>Start date
+          <input type="date" id="trip-start-date" />
+        </label>
+        <label>Max days
+          <input type="number" id="max-days" min="1" placeholder="(none)" style="width: 7ch" />
+        </label>
+        <label>Default stay (days)
+          <input type="number" id="days-per-city" min="0" value="1" style="width: 6ch" />
+        </label>
+      </div>
+      <p class="hint">
+        Per-city overrides (stay length, pinned date) appear next to each destination
+        above once you've added them. Pins require a Start date.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>3. What to minimise</h2>
       <div class="row">
         <label><input type="radio" name="optimise" value="distance" /> Distance</label>
         <label><input type="radio" name="optimise" value="time" checked /> Time</label>
@@ -41,7 +68,7 @@
     </section>
 
     <section class="card">
-      <h2>3. Live data <span class="hint">(optional)</span></h2>
+      <h2>4. Live data <span class="hint">(optional)</span></h2>
 
       <details>
         <summary>Google Maps (geocoding + driving/transit routing)</summary>
@@ -137,9 +164,10 @@
           <tr>
             <th>Mode</th>
             <th>Distance</th>
-            <th>Time</th>
+            <th>Travel</th>
             <th>Cost</th>
-            <th>Tour</th>
+            <th>Days</th>
+            <th>Itinerary</th>
           </tr>
         </thead>
         <tbody></tbody>
