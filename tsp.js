@@ -15,6 +15,8 @@
 //   node tsp.js --city London --city Paris --city Rome
 //   node tsp.js --cities-file mycities.json
 //   node tsp.js --geocoder google --router google --google-key $GOOGLE_MAPS_API_KEY
+//   node tsp.js --amadeus-key $AMADEUS_API_KEY --amadeus-secret $AMADEUS_API_SECRET \
+//               --depart-date 2026-06-01
 //   node tsp.js --serpapi-key $SERPAPI_KEY --depart-date 2026-06-01
 //
 // Requires Node 18+ for built-in fetch.
@@ -273,6 +275,106 @@ const SCRAPE_CONVERTERS = {
   identity: (x) => x,
 };
 
+class AmadeusFlightPrices {
+  static TEST_BASE = 'https://test.api.amadeus.com';
+  static PROD_BASE = 'https://api.amadeus.com';
+
+  constructor(apiKey, apiSecret, departDate, { currency = 'GBP', useProd = false } = {}) {
+    this.apiKey = apiKey;
+    this.apiSecret = apiSecret;
+    this.departDate = departDate;
+    this.currency = currency;
+    this.base = useProd ? AmadeusFlightPrices.PROD_BASE : AmadeusFlightPrices.TEST_BASE;
+    this.token = null;
+    this.tokenExpiresAt = 0;
+    this.airportCache = new Map();
+    this.priceCache = new Map();
+  }
+
+  async _getToken() {
+    if (this.token && Date.now() / 1000 < this.tokenExpiresAt - 30) return this.token;
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: this.apiKey,
+      client_secret: this.apiSecret,
+    }).toString();
+    try {
+      const r = await fetch(`${this.base}/v1/security/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'tsp-tool/1.0' },
+        body,
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const payload = await r.json();
+      this.token = payload.access_token;
+      this.tokenExpiresAt = Date.now() / 1000 + (payload.expires_in || 1799);
+      return this.token;
+    } catch (e) {
+      console.error(`  ! Amadeus auth failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  async _authedGet(path, params) {
+    const token = await this._getToken();
+    if (!token) return null;
+    const url = `${this.base}${path}?${new URLSearchParams(params).toString()}`;
+    return httpGetJson(url, {
+      headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'tsp-tool/1.0' },
+      timeoutMs: 20000,
+    });
+  }
+
+  async _nearestAirport(city) {
+    const key = `${city.lat.toFixed(3)},${city.lon.toFixed(3)}`;
+    if (this.airportCache.has(key)) return this.airportCache.get(key);
+    try {
+      const data = await this._authedGet('/v1/reference-data/locations/airports', {
+        latitude: city.lat.toFixed(4),
+        longitude: city.lon.toFixed(4),
+        radius: '200',
+        'page[limit]': '1',
+        sort: 'relevance',
+      });
+      const results = (data && data.data) || [];
+      const iata = results[0] ? results[0].iataCode : null;
+      this.airportCache.set(key, iata);
+      return iata;
+    } catch (e) {
+      console.error(`  ! Amadeus airport lookup for ${city.name}: ${e.message}`);
+      this.airportCache.set(key, null);
+      return null;
+    }
+  }
+
+  async legPrice(modeName, a, b) {
+    if (modeName !== 'Flight') return null;
+    const cacheKey = `${a.name}|${b.name}`;
+    if (this.priceCache.has(cacheKey)) return this.priceCache.get(cacheKey);
+    const [orig, dest] = await Promise.all([this._nearestAirport(a), this._nearestAirport(b)]);
+    if (!orig || !dest || orig === dest) { this.priceCache.set(cacheKey, null); return null; }
+    try {
+      const data = await this._authedGet('/v2/shopping/flight-offers', {
+        originLocationCode: orig,
+        destinationLocationCode: dest,
+        departureDate: this.departDate,
+        adults: '1',
+        currencyCode: this.currency,
+        max: '1',
+        nonStop: 'false',
+      });
+      const offers = (data && data.data) || [];
+      const price = offers[0] ? Number(offers[0].price.grandTotal) : null;
+      this.priceCache.set(cacheKey, price);
+      return price;
+    } catch (e) {
+      console.error(`  ! Amadeus flight search ${orig}->${dest}: ${e.message}`);
+      this.priceCache.set(cacheKey, null);
+      return null;
+    }
+  }
+}
+
 class ScrapedPerKmPrices {
   constructor(config) {
     this.config = config || {};
@@ -300,7 +402,7 @@ class ScrapedPerKmPrices {
 }
 
 class PriceStack {
-  constructor(config, { scraped = null, flights = null } = {}) {
+  constructor(config, { scraped = null, flights = [] } = {}) {
     this.config = config;
     this.scraped = scraped;
     this.flights = flights;
@@ -314,8 +416,8 @@ class PriceStack {
   }
   perLegFixed(name) { return this.config.perLegFixed(name); }
   async legPrice(name, a, b) {
-    if (this.flights) {
-      const v = await this.flights.legPrice(name, a, b);
+    for (const p of this.flights) {
+      const v = await p.legPrice(name, a, b);
       if (v != null) return v;
     }
     return null;
@@ -501,8 +603,13 @@ function parseArgs(argv) {
   const out = {
     interactive: false, city: [], citiesFile: null,
     geocoder: 'local', router: 'haversine', pricesFile: 'prices.json',
-    enableScrapers: false, googleKey: process.env.GOOGLE_MAPS_API_KEY || null,
-    serpapiKey: process.env.SERPAPI_KEY || null, departDate: null,
+    enableScrapers: false,
+    googleKey: process.env.GOOGLE_MAPS_API_KEY || null,
+    serpapiKey: process.env.SERPAPI_KEY || null,
+    amadeusKey: process.env.AMADEUS_API_KEY || null,
+    amadeusSecret: process.env.AMADEUS_API_SECRET || null,
+    amadeusProd: false,
+    departDate: null,
     optimise: 'time',
   };
   for (let i = 0; i < argv.length; i++) {
@@ -518,6 +625,9 @@ function parseArgs(argv) {
       case '--enable-scrapers': out.enableScrapers = true; break;
       case '--google-key': out.googleKey = next(); break;
       case '--serpapi-key': out.serpapiKey = next(); break;
+      case '--amadeus-key': out.amadeusKey = next(); break;
+      case '--amadeus-secret': out.amadeusSecret = next(); break;
+      case '--amadeus-prod': out.amadeusProd = true; break;
       case '--depart-date': out.departDate = next(); break;
       case '--optimise': out.optimise = next(); break;
       case '-h': case '--help':
@@ -558,20 +668,25 @@ function buildRouter(name, googleKey) {
   throw new Error(`unknown router ${name}`);
 }
 
-function buildPrices(modes, pricesFile, serpapiKey, departDate, enableScrapers) {
+function buildPrices(modes, pricesFile, opts) {
+  const { serpapiKey, amadeusKey, amadeusSecret, amadeusProd, departDate, enableScrapers } = opts;
   const config = new ConfigPrices(modes, pricesFile);
   let scraped = null;
   if (enableScrapers && pricesFile && fs.existsSync(pricesFile)) {
     const data = JSON.parse(fs.readFileSync(pricesFile, 'utf8'));
     if (data.scrapers) scraped = new ScrapedPerKmPrices(data.scrapers);
   }
-  let flights = null;
-  if (serpapiKey) {
-    if (!departDate) {
-      console.error('--serpapi-key given without --depart-date; skipping live flight prices.');
-    } else {
-      flights = new SerpApiFlightPrices(serpapiKey, departDate);
+  const flights = [];
+  const needsDate = amadeusKey || serpapiKey;
+  if (needsDate && !departDate) {
+    console.error('flight API keys given without --depart-date; skipping live flight prices.');
+  } else {
+    if (amadeusKey && amadeusSecret && departDate) {
+      flights.push(new AmadeusFlightPrices(amadeusKey, amadeusSecret, departDate, { useProd: !!amadeusProd }));
+    } else if (amadeusKey && !amadeusSecret) {
+      console.error('--amadeus-key given without --amadeus-secret; skipping Amadeus.');
     }
+    if (serpapiKey && departDate) flights.push(new SerpApiFlightPrices(serpapiKey, departDate));
   }
   return new PriceStack(config, { scraped, flights });
 }
@@ -584,7 +699,14 @@ async function main() {
   }
   const geocoder = buildGeocoder(args.geocoder, args.googleKey);
   const router = buildRouter(args.router, args.googleKey);
-  const prices = buildPrices(DEFAULT_MODES, args.pricesFile, args.serpapiKey, args.departDate, args.enableScrapers);
+  const prices = buildPrices(DEFAULT_MODES, args.pricesFile, {
+    serpapiKey: args.serpapiKey,
+    amadeusKey: args.amadeusKey,
+    amadeusSecret: args.amadeusSecret,
+    amadeusProd: args.amadeusProd,
+    departDate: args.departDate,
+    enableScrapers: args.enableScrapers,
+  });
 
   const cities = [];
   if (args.citiesFile) cities.push(...loadCitiesFile(args.citiesFile));
@@ -608,6 +730,6 @@ module.exports = {
   haversineKm, legCost, solveTsp, report,
   LocalGazetteer, NominatimGeocoder, GoogleGeocoder, FallbackGeocoder,
   HaversineRouter, GoogleRoutesRouter,
-  ConfigPrices, SerpApiFlightPrices, ScrapedPerKmPrices, PriceStack,
+  ConfigPrices, SerpApiFlightPrices, AmadeusFlightPrices, ScrapedPerKmPrices, PriceStack,
   DEFAULT_MODES, DEFAULT_CITIES,
 };

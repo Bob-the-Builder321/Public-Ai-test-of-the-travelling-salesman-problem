@@ -19,6 +19,8 @@ CLI examples:
   python tsp.py --city London --city Paris --city Rome
   python tsp.py --cities-file mycities.json
   python tsp.py --geocoder google --router google --google-key $GOOGLE_MAPS_API_KEY
+  python tsp.py --amadeus-key $AMADEUS_API_KEY --amadeus-secret $AMADEUS_API_SECRET \\
+                --depart-date 2026-06-01
   python tsp.py --serpapi-key $SERPAPI_KEY --depart-date 2026-06-01
 """
 
@@ -29,6 +31,7 @@ import json
 import math
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -322,6 +325,123 @@ class SerpApiFlightPrices:
             return None
 
 
+class AmadeusFlightPrices:
+    """Real flight fares via Amadeus Self-Service API (free tier: 2000 calls/month).
+    Sign up at developers.amadeus.com to get an API key + secret. Test endpoint is
+    used by default; pass use_prod=True for production traffic.
+
+    Resolves each City to its nearest IATA airport via Amadeus's own airport-lookup
+    endpoint, then queries Flight Offers Search for the cheapest one-way fare.
+    """
+
+    TEST_BASE = "https://test.api.amadeus.com"
+    PROD_BASE = "https://api.amadeus.com"
+
+    def __init__(self, api_key: str, api_secret: str, depart_date: str,
+                 currency: str = "GBP", use_prod: bool = False):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.depart_date = depart_date
+        self.currency = currency
+        self.base = self.PROD_BASE if use_prod else self.TEST_BASE
+        self.token: Optional[str] = None
+        self.token_expires_at: float = 0
+        self.airport_cache: dict[tuple[float, float], Optional[str]] = {}
+        self.price_cache: dict[tuple[str, str], Optional[float]] = {}
+
+    def _get_token(self) -> Optional[str]:
+        if self.token and time.time() < self.token_expires_at - 30:
+            return self.token
+        body = urllib.parse.urlencode({
+            "grant_type": "client_credentials",
+            "client_id": self.api_key,
+            "client_secret": self.api_secret,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.base}/v1/security/oauth2/token",
+            data=body, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "User-Agent": "tsp-tool/1.0"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                payload = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            print(f"  ! Amadeus auth failed: {e}", file=sys.stderr)
+            return None
+        self.token = payload["access_token"]
+        self.token_expires_at = time.time() + payload.get("expires_in", 1799)
+        return self.token
+
+    def _nearest_airport(self, city: City) -> Optional[str]:
+        key = (round(city.lat, 3), round(city.lon, 3))
+        if key in self.airport_cache:
+            return self.airport_cache[key]
+        token = self._get_token()
+        if not token:
+            self.airport_cache[key] = None
+            return None
+        params = urllib.parse.urlencode({
+            "latitude": f"{city.lat:.4f}",
+            "longitude": f"{city.lon:.4f}",
+            "radius": "200",
+            "page[limit]": "1",
+            "sort": "relevance",
+        })
+        try:
+            data = http_get_json(
+                f"{self.base}/v1/reference-data/locations/airports?{params}",
+                headers={"Authorization": f"Bearer {token}",
+                         "User-Agent": "tsp-tool/1.0"},
+            )
+            results = data.get("data") or []
+            iata = results[0]["iataCode"] if results else None
+        except Exception as e:
+            print(f"  ! Amadeus airport lookup for {city.name}: {e}", file=sys.stderr)
+            iata = None
+        self.airport_cache[key] = iata
+        return iata
+
+    def leg_price(self, mode_name: str, a: City, b: City) -> Optional[float]:
+        if mode_name != "Flight":
+            return None
+        cache_key = (a.name, b.name)
+        if cache_key in self.price_cache:
+            return self.price_cache[cache_key]
+        orig = self._nearest_airport(a)
+        dest = self._nearest_airport(b)
+        if not orig or not dest or orig == dest:
+            self.price_cache[cache_key] = None
+            return None
+        token = self._get_token()
+        if not token:
+            self.price_cache[cache_key] = None
+            return None
+        params = urllib.parse.urlencode({
+            "originLocationCode": orig,
+            "destinationLocationCode": dest,
+            "departureDate": self.depart_date,
+            "adults": "1",
+            "currencyCode": self.currency,
+            "max": "1",
+            "nonStop": "false",
+        })
+        try:
+            data = http_get_json(
+                f"{self.base}/v2/shopping/flight-offers?{params}",
+                headers={"Authorization": f"Bearer {token}",
+                         "User-Agent": "tsp-tool/1.0"},
+                timeout=20,
+            )
+            offers = data.get("data") or []
+            price = float(offers[0]["price"]["grandTotal"]) if offers else None
+        except Exception as e:
+            print(f"  ! Amadeus flight search {orig}->{dest}: {e}", file=sys.stderr)
+            price = None
+        self.price_cache[cache_key] = price
+        return price
+
+
 class ScrapedPerKmPrices:
     """Best-effort: refresh per-km cost for fuel-driven modes from a user-supplied
     URL + JSON path or regex. Falls back to None on any failure.
@@ -371,14 +491,15 @@ class ScrapedPerKmPrices:
 
 
 class PriceStack:
-    """Layered provider: scraped per-km overrides config; SerpAPI overrides per-leg."""
+    """Layered provider: scraped per-km overrides config; the first flight provider
+    to return a non-None price wins for per-leg flight cost."""
 
     def __init__(self, config: ConfigPrices,
                  scraped: Optional[ScrapedPerKmPrices] = None,
-                 flights: Optional[SerpApiFlightPrices] = None):
+                 flights: Optional[list] = None):
         self.config = config
         self.scraped = scraped
-        self.flights = flights
+        self.flights = flights or []
 
     def per_km(self, mode_name: str) -> float:
         if self.scraped is not None:
@@ -391,8 +512,8 @@ class PriceStack:
         return self.config.per_leg_fixed(mode_name)
 
     def leg_price(self, mode_name: str, a: City, b: City) -> Optional[float]:
-        if self.flights is not None:
-            v = self.flights.leg_price(mode_name, a, b)
+        for provider in self.flights:
+            v = provider.leg_price(mode_name, a, b)
             if v is not None:
                 return v
         return None
@@ -597,7 +718,9 @@ def build_router(name: str, google_key: Optional[str]):
     raise ValueError(f"unknown router {name}")
 
 
-def build_prices(modes, prices_file, serpapi_key, depart_date, enable_scrapers):
+def build_prices(modes, prices_file, *, serpapi_key=None, amadeus_key=None,
+                 amadeus_secret=None, amadeus_prod=False, depart_date=None,
+                 enable_scrapers=False):
     config = ConfigPrices(modes, overrides_file=prices_file)
     scraped = None
     if enable_scrapers and prices_file and os.path.exists(prices_file):
@@ -606,13 +729,20 @@ def build_prices(modes, prices_file, serpapi_key, depart_date, enable_scrapers):
         scraper_cfg = data.get("scrapers")
         if scraper_cfg:
             scraped = ScrapedPerKmPrices(scraper_cfg)
-    flights = None
-    if serpapi_key:
-        if not depart_date:
-            print("--serpapi-key given without --depart-date; skipping live flight prices.",
+    flights: list = []
+    needs_date = amadeus_key or serpapi_key
+    if needs_date and not depart_date:
+        print("flight API keys given without --depart-date; skipping live flight prices.",
+              file=sys.stderr)
+    else:
+        if amadeus_key and amadeus_secret and depart_date:
+            flights.append(AmadeusFlightPrices(amadeus_key, amadeus_secret, depart_date,
+                                               use_prod=amadeus_prod))
+        elif amadeus_key and not amadeus_secret:
+            print("--amadeus-key given without --amadeus-secret; skipping Amadeus.",
                   file=sys.stderr)
-        else:
-            flights = SerpApiFlightPrices(serpapi_key, depart_date)
+        if serpapi_key and depart_date:
+            flights.append(SerpApiFlightPrices(serpapi_key, depart_date))
     return PriceStack(config, scraped=scraped, flights=flights)
 
 
@@ -634,15 +764,28 @@ def main():
                       help="Google Maps API key (geocoding + distance matrix)")
     prov.add_argument("--serpapi-key", default=os.environ.get("SERPAPI_KEY"),
                       help="SerpAPI key for live Google Flights prices")
-    prov.add_argument("--depart-date", help="YYYY-MM-DD for flight quotes (required with --serpapi-key)")
+    prov.add_argument("--amadeus-key", default=os.environ.get("AMADEUS_API_KEY"),
+                      help="Amadeus Self-Service API key (recommended; free tier)")
+    prov.add_argument("--amadeus-secret", default=os.environ.get("AMADEUS_API_SECRET"),
+                      help="Amadeus Self-Service API secret")
+    prov.add_argument("--amadeus-prod", action="store_true",
+                      help="use Amadeus production endpoint instead of test")
+    prov.add_argument("--depart-date", help="YYYY-MM-DD for flight quotes (required with flight API keys)")
 
     p.add_argument("--optimise", choices=["distance", "time", "cost"], default="time")
     args = p.parse_args()
 
     geocoder = build_geocoder(args.geocoder, args.google_key)
     router = build_router(args.router, args.google_key)
-    prices = build_prices(DEFAULT_MODES, args.prices_file, args.serpapi_key,
-                          args.depart_date, args.enable_scrapers)
+    prices = build_prices(
+        DEFAULT_MODES, args.prices_file,
+        serpapi_key=args.serpapi_key,
+        amadeus_key=args.amadeus_key,
+        amadeus_secret=args.amadeus_secret,
+        amadeus_prod=args.amadeus_prod,
+        depart_date=args.depart_date,
+        enable_scrapers=args.enable_scrapers,
+    )
 
     cities: list[City] = []
     if args.cities_file:

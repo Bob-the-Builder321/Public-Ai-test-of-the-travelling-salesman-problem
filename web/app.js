@@ -168,6 +168,106 @@ class ConfigPrices {
   update(name, field, value) { if (this.byName[name]) this.byName[name][field] = value; }
 }
 
+class AmadeusFlightPrices {
+  static TEST_BASE = 'https://test.api.amadeus.com';
+  static PROD_BASE = 'https://api.amadeus.com';
+
+  constructor(apiKey, apiSecret, departDate, { currency = 'GBP', useProd = false } = {}) {
+    this.apiKey = apiKey;
+    this.apiSecret = apiSecret;
+    this.departDate = departDate;
+    this.currency = currency;
+    this.base = useProd ? AmadeusFlightPrices.PROD_BASE : AmadeusFlightPrices.TEST_BASE;
+    this.token = null;
+    this.tokenExpiresAt = 0;
+    this.airportCache = new Map();
+    this.priceCache = new Map();
+  }
+
+  async _getToken() {
+    if (this.token && Date.now() / 1000 < this.tokenExpiresAt - 30) return this.token;
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: this.apiKey,
+      client_secret: this.apiSecret,
+    }).toString();
+    try {
+      const r = await fetch(`${this.base}/v1/security/oauth2/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const payload = await r.json();
+      this.token = payload.access_token;
+      this.tokenExpiresAt = Date.now() / 1000 + (payload.expires_in || 1799);
+      return this.token;
+    } catch (e) {
+      console.warn('Amadeus auth:', e.message);
+      return null;
+    }
+  }
+
+  async _authedGet(path, params) {
+    const token = await this._getToken();
+    if (!token) return null;
+    const r = await fetch(`${this.base}${path}?${new URLSearchParams(params).toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async _nearestAirport(city) {
+    const key = `${city.lat.toFixed(3)},${city.lon.toFixed(3)}`;
+    if (this.airportCache.has(key)) return this.airportCache.get(key);
+    try {
+      const data = await this._authedGet('/v1/reference-data/locations/airports', {
+        latitude: city.lat.toFixed(4),
+        longitude: city.lon.toFixed(4),
+        radius: '200',
+        'page[limit]': '1',
+        sort: 'relevance',
+      });
+      const results = (data && data.data) || [];
+      const iata = results[0] ? results[0].iataCode : null;
+      this.airportCache.set(key, iata);
+      return iata;
+    } catch (e) {
+      console.warn(`Amadeus airport ${city.name}:`, e.message);
+      this.airportCache.set(key, null);
+      return null;
+    }
+  }
+
+  async legPrice(modeName, a, b) {
+    if (modeName !== 'Flight') return null;
+    const cacheKey = `${a.name}|${b.name}`;
+    if (this.priceCache.has(cacheKey)) return this.priceCache.get(cacheKey);
+    const [orig, dest] = await Promise.all([this._nearestAirport(a), this._nearestAirport(b)]);
+    if (!orig || !dest || orig === dest) { this.priceCache.set(cacheKey, null); return null; }
+    try {
+      const data = await this._authedGet('/v2/shopping/flight-offers', {
+        originLocationCode: orig,
+        destinationLocationCode: dest,
+        departureDate: this.departDate,
+        adults: '1',
+        currencyCode: this.currency,
+        max: '1',
+        nonStop: 'false',
+      });
+      const offers = (data && data.data) || [];
+      const price = offers[0] ? Number(offers[0].price.grandTotal) : null;
+      this.priceCache.set(cacheKey, price);
+      return price;
+    } catch (e) {
+      console.warn(`Amadeus flight ${orig}->${dest}:`, e.message);
+      this.priceCache.set(cacheKey, null);
+      return null;
+    }
+  }
+}
+
 class SerpApiFlightPrices {
   constructor(apiKey, departDate, currency = 'GBP') {
     this.apiKey = apiKey; this.departDate = departDate; this.currency = currency;
@@ -201,11 +301,14 @@ class SerpApiFlightPrices {
 }
 
 class PriceStack {
-  constructor(config, { flights = null } = {}) { this.config = config; this.flights = flights; }
+  constructor(config, { flights = [] } = {}) { this.config = config; this.flights = flights; }
   async perKm(name) { return this.config.perKm(name); }
   perLegFixed(name) { return this.config.perLegFixed(name); }
   async legPrice(name, a, b) {
-    if (this.flights) { const v = await this.flights.legPrice(name, a, b); if (v != null) return v; }
+    for (const p of this.flights) {
+      const v = await p.legPrice(name, a, b);
+      if (v != null) return v;
+    }
     return null;
   }
   modes() { return this.config.modes(); }
@@ -387,11 +490,18 @@ function activeRouter() {
 }
 
 function activePrices() {
-  let flights = null;
+  const flights = [];
+  if ($('use-amadeus').checked) {
+    const key = $('amadeus-key').value.trim();
+    const secret = $('amadeus-secret').value.trim();
+    const date = $('amadeus-date').value;
+    const useProd = $('amadeus-prod').checked;
+    if (key && secret && date) flights.push(new AmadeusFlightPrices(key, secret, date, { useProd }));
+  }
   if ($('use-serpapi').checked) {
     const key = $('serpapi-key').value.trim();
     const date = $('depart-date').value;
-    if (key && date) flights = new SerpApiFlightPrices(key, date);
+    if (key && date) flights.push(new SerpApiFlightPrices(key, date));
   }
   return new PriceStack(state.prices, { flights });
 }

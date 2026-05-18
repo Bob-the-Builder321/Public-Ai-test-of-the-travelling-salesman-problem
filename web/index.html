@@ -62,6 +62,31 @@
         </p>
       </details>
 
+      <details open>
+        <summary>Amadeus Self-Service (recommended free tier)</summary>
+        <div class="row">
+          <label>API key
+            <input type="password" id="amadeus-key" autocomplete="off" placeholder="Amadeus key" />
+          </label>
+          <label>API secret
+            <input type="password" id="amadeus-secret" autocomplete="off" placeholder="Amadeus secret" />
+          </label>
+          <label>Depart date
+            <input type="date" id="amadeus-date" />
+          </label>
+        </div>
+        <div class="row">
+          <label><input type="checkbox" id="use-amadeus" /> Fetch live flight prices</label>
+          <label><input type="checkbox" id="amadeus-prod" /> Use production endpoint</label>
+        </div>
+        <p class="hint">
+          Sign up at <code>developers.amadeus.com</code> for a free key (2000 calls/month).
+          The browser calls Amadeus directly; their CORS policy is permissive but check
+          your DevTools console if the call is blocked. Each city is mapped to its nearest
+          IATA airport automatically.
+        </p>
+      </details>
+
       <details>
         <summary>Google Flights prices (via SerpAPI)</summary>
         <div class="row">
