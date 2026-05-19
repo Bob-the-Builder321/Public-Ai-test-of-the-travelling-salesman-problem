@@ -32,6 +32,21 @@
     </section>
 
     <section class="card">
+      <h2>1b. Group travel <span class="hint">(optional)</span></h2>
+      <div class="row">
+        <input type="text" id="starter-name" placeholder="Someone's home city" />
+        <button id="add-starter">Add starter</button>
+        <button id="clear-starters" class="secondary">Clear</button>
+      </div>
+      <p class="hint">
+        Add one home city per person. The solver tries every destination as the meeting point
+        and picks the one minimising (everyone's travel to meet) + (the joint tour from there)
+        per mode.
+      </p>
+      <ul id="starter-list" class="city-list"></ul>
+    </section>
+
+    <section class="card">
       <h2>2. Schedule <span class="hint">(optional but enables date-aware results)</span></h2>
       <div class="row">
         <label>Start city
@@ -59,16 +74,56 @@
     </section>
 
     <section class="card">
-      <h2>3. What to minimise</h2>
+      <h2>3. Rail policy <span class="hint">(optional)</span></h2>
+      <div class="row">
+        <label><input type="checkbox" id="interrail" /> I'm using an Interrail pass</label>
+        <label><input type="checkbox" id="exclude-eurostar" /> Exclude Eurostar</label>
+        <label><input type="checkbox" id="seat-reservations-ok" checked /> Seat reservations are fine</label>
+      </div>
+      <div class="row">
+        <label>Night trains
+          <select id="night-trains">
+            <option value="exclude" selected>Exclude</option>
+            <option value="include">Include (show both)</option>
+            <option value="only">Only night trains</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">
+        With a pass, Train per-km cost becomes £0 plus a small per-leg reservation fee.
+        "Exclude Eurostar" makes channel-crossing Train legs infeasible. "Night trains: only"
+        replaces the regular Train mode with a slower Night train mode (with a sleeper supplement)
+        and rules out legs that are too short for a sleeper route.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>4. What to minimise &amp; currency</h2>
       <div class="row">
         <label><input type="radio" name="optimise" value="distance" /> Distance</label>
         <label><input type="radio" name="optimise" value="time" checked /> Time</label>
         <label><input type="radio" name="optimise" value="cost" /> Cost</label>
+        <label style="margin-left:1rem">Currency
+          <select id="currency">
+            <option>GBP</option><option>EUR</option><option>USD</option>
+            <option>CAD</option><option>AUD</option><option>NZD</option>
+            <option>JPY</option><option>CHF</option><option>SEK</option>
+            <option>NOK</option><option>DKK</option><option>PLN</option>
+            <option>CZK</option><option>HUF</option><option>CNY</option>
+            <option>INR</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="cache-enabled" checked /> Cache API results</label>
+        <button id="clear-cache" class="secondary">Clear cache</button>
       </div>
+      <p class="hint">
+        Cache lives in your browser's localStorage and lasts 24 hours. Speeds up repeated runs
+        and reduces Nominatim/Google/Amadeus/SerpAPI calls.
+      </p>
     </section>
 
     <section class="card">
-      <h2>4. Live data <span class="hint">(optional)</span></h2>
+      <h2>5. Live data <span class="hint">(optional)</span></h2>
 
       <details>
         <summary>Google Maps (geocoding + driving/transit routing)</summary>
@@ -138,16 +193,21 @@
           <thead>
             <tr>
               <th>Mode</th>
-              <th>£ / km</th>
+              <th>Cost / km</th>
               <th>Avg km/h</th>
               <th>Detour ×</th>
-              <th>Fixed £ / leg</th>
-              <th>Fixed h / leg</th>
+              <th>Fixed / leg</th>
+              <th>To terminal h</th>
+              <th>Wait h</th>
+              <th>From terminal h</th>
             </tr>
           </thead>
           <tbody></tbody>
         </table>
-        <p class="hint">Edit any cell. Values persist for this session only.</p>
+        <p class="hint">
+          Edit any cell. Per-leg time = (to terminal) + (wait at terminal) + (from terminal),
+          so flights pay airport access and security; cars are zero. Session-only.
+        </p>
       </details>
     </section>
 

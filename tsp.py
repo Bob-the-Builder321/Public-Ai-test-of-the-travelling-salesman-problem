@@ -59,19 +59,33 @@ class Mode:
     detour_factor: float
     avg_speed_kmh: float
     cost_per_km: float
-    fixed_time_per_leg_h: float = 0.0
+    terminal_access_h: float = 0.0
+    boarding_wait_h: float = 0.0
+    terminal_egress_h: float = 0.0
     fixed_cost_per_leg: float = 0.0
+
+    @property
+    def fixed_time_per_leg_h(self) -> float:
+        return self.terminal_access_h + self.boarding_wait_h + self.terminal_egress_h
+
+    @fixed_time_per_leg_h.setter
+    def fixed_time_per_leg_h(self, value: float) -> None:
+        self.terminal_access_h = 0.0
+        self.terminal_egress_h = 0.0
+        self.boarding_wait_h = float(value)
 
 
 DEFAULT_MODES: list[Mode] = [
-    Mode("ICE car",  detour_factor=1.30, avg_speed_kmh=90,  cost_per_km=0.15),
-    Mode("EV car",   detour_factor=1.30, avg_speed_kmh=90,  cost_per_km=0.05),
-    Mode("Coach",    detour_factor=1.35, avg_speed_kmh=65,  cost_per_km=0.04,
-         fixed_time_per_leg_h=0.25, fixed_cost_per_leg=1.0),
-    Mode("Train",    detour_factor=1.20, avg_speed_kmh=120, cost_per_km=0.12,
-         fixed_time_per_leg_h=0.25, fixed_cost_per_leg=2.0),
-    Mode("Flight",   detour_factor=1.00, avg_speed_kmh=700, cost_per_km=0.20,
-         fixed_time_per_leg_h=2.50, fixed_cost_per_leg=30.0),
+    # ICE/EV cars: door-to-door, no terminal overhead.
+    Mode("ICE car",     1.30,  90, 0.15, 0.00, 0.00, 0.00, 0.0),
+    Mode("EV car",      1.30,  90, 0.05, 0.00, 0.00, 0.00, 0.0),
+    # Coach/Train: 15 min to station, 15 min wait, 15 min from station.
+    Mode("Coach",       1.35,  65, 0.04, 0.25, 0.25, 0.25, 1.0),
+    Mode("Train",       1.20, 120, 0.12, 0.25, 0.25, 0.25, 2.0),
+    # Night train: 30 min board (luggage + sleeper).
+    Mode("Night train", 1.20,  80, 0.10, 0.25, 0.50, 0.25, 30.0),
+    # Flight: 45 min to/from airport, 2h security + boarding wait.
+    Mode("Flight",      1.00, 700, 0.20, 0.75, 2.00, 0.75, 30.0),
 ]
 
 
@@ -102,6 +116,100 @@ def http_get_text(url: str, timeout: float = 15.0, headers: Optional[dict] = Non
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "tsp-tool/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Currency
+# ---------------------------------------------------------------------------
+
+
+CURRENCY_SYMBOLS = {
+    "GBP": "£", "EUR": "€", "USD": "$", "CAD": "C$", "AUD": "A$",
+    "NZD": "NZ$", "JPY": "¥", "CNY": "¥", "INR": "₹", "CHF": "CHF",
+    "SEK": "kr", "NOK": "kr", "DKK": "kr", "PLN": "zł", "CZK": "Kč",
+    "HUF": "Ft",
+}
+
+
+def currency_symbol(code: str) -> str:
+    return CURRENCY_SYMBOLS.get(code.upper(), code.upper() + " ")
+
+
+# ---------------------------------------------------------------------------
+# Disk cache + caching wrappers (reduces repeated API calls)
+# ---------------------------------------------------------------------------
+
+
+class JsonCache:
+    def __init__(self, path: Optional[str] = None, ttl_seconds: int = 86400,
+                 enabled: bool = True):
+        self.path = path or os.path.join(os.path.expanduser("~"), ".tsp-tool-cache.json")
+        self.ttl = ttl_seconds
+        self.enabled = enabled
+        self.data: dict = {}
+        if enabled:
+            try:
+                with open(self.path) as f:
+                    self.data = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                self.data = {}
+            except Exception as e:
+                print(f"cache load failed: {e}", file=sys.stderr)
+
+    def get(self, key: str):
+        if not self.enabled:
+            return None
+        entry = self.data.get(key)
+        if not entry:
+            return None
+        if time.time() - entry.get("ts", 0) > self.ttl:
+            return None
+        return entry.get("v")
+
+    def set(self, key: str, value) -> None:
+        if not self.enabled:
+            return
+        self.data[key] = {"ts": time.time(), "v": value}
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.data, f)
+            os.replace(tmp, self.path)
+        except Exception as e:
+            print(f"cache save failed: {e}", file=sys.stderr)
+
+
+class CachedGeocoder:
+    """Wrap any geocoder with a disk cache keyed on (provider type, normalized name)."""
+    def __init__(self, inner, cache: JsonCache):
+        self.inner = inner
+        self.cache = cache
+
+    def geocode(self, name: str):
+        key = f"geo:{type(self.inner).__name__}:{name.strip().lower()}"
+        v = self.cache.get(key)
+        if v is not None:
+            return tuple(v) if v else None
+        r = self.inner.geocode(name)
+        self.cache.set(key, list(r) if r else [])
+        return r
+
+
+class CachedRouter:
+    """Wrap any router with a disk cache keyed on (provider type, mode, endpoints)."""
+    def __init__(self, inner, cache: JsonCache):
+        self.inner = inner
+        self.cache = cache
+
+    def route(self, mode, a, b):
+        key = (f"route:{type(self.inner).__name__}:{mode.name}:"
+               f"{a.lat:.4f},{a.lon:.4f}->{b.lat:.4f},{b.lon:.4f}")
+        v = self.cache.get(key)
+        if v is not None:
+            return tuple(v)
+        r = self.inner.route(mode, a, b)
+        self.cache.set(key, list(r))
+        return r
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +393,13 @@ class SerpApiFlightPrices:
 
     URL = "https://serpapi.com/search"
 
-    def __init__(self, api_key: str, depart_date: str, currency: str = "GBP"):
+    def __init__(self, api_key: str, depart_date: str, currency: str = "GBP",
+                 cache: Optional[JsonCache] = None):
         self.api_key = api_key
         self.depart_date = depart_date
         self.currency = currency
-        self.cache: dict[tuple[str, str], Optional[float]] = {}
+        self.cache_mem: dict[tuple[str, str], Optional[float]] = {}
+        self.disk_cache = cache
 
     def _iata_hint(self, city: City) -> str:
         # SerpAPI's google_flights engine accepts city names; we pass coordinates
@@ -300,8 +410,14 @@ class SerpApiFlightPrices:
         if mode_name != "Flight":
             return None
         key = (a.name, b.name)
-        if key in self.cache:
-            return self.cache[key]
+        if key in self.cache_mem:
+            return self.cache_mem[key]
+        disk_key = f"serpapi:{self.currency}:{self.depart_date}:{a.name}->{b.name}"
+        if self.disk_cache:
+            v = self.disk_cache.get(disk_key)
+            if v is not None:
+                self.cache_mem[key] = v if v != "" else None
+                return self.cache_mem[key]
         params = {
             "engine": "google_flights",
             "departure_id": self._iata_hint(a),
@@ -320,12 +436,13 @@ class SerpApiFlightPrices:
                 if f.get("price") is not None:
                     price = float(f["price"])
                     break
-            self.cache[key] = price
-            return price
         except Exception as e:
             print(f"  ! SerpAPI flights {a.name}->{b.name}: {e}", file=sys.stderr)
-            self.cache[key] = None
-            return None
+            price = None
+        self.cache_mem[key] = price
+        if self.disk_cache:
+            self.disk_cache.set(disk_key, price if price is not None else "")
+        return price
 
 
 class AmadeusFlightPrices:
@@ -341,7 +458,8 @@ class AmadeusFlightPrices:
     PROD_BASE = "https://api.amadeus.com"
 
     def __init__(self, api_key: str, api_secret: str, depart_date: str,
-                 currency: str = "GBP", use_prod: bool = False):
+                 currency: str = "GBP", use_prod: bool = False,
+                 cache: Optional[JsonCache] = None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.depart_date = depart_date
@@ -351,6 +469,7 @@ class AmadeusFlightPrices:
         self.token_expires_at: float = 0
         self.airport_cache: dict[tuple[float, float], Optional[str]] = {}
         self.price_cache: dict[tuple[str, str], Optional[float]] = {}
+        self.disk_cache = cache
 
     def _get_token(self) -> Optional[str]:
         if self.token and time.time() < self.token_expires_at - 30:
@@ -380,6 +499,12 @@ class AmadeusFlightPrices:
         key = (round(city.lat, 3), round(city.lon, 3))
         if key in self.airport_cache:
             return self.airport_cache[key]
+        disk_key = f"amadeus_airport:{key[0]},{key[1]}"
+        if self.disk_cache:
+            v = self.disk_cache.get(disk_key)
+            if v is not None:
+                self.airport_cache[key] = v if v else None
+                return self.airport_cache[key]
         token = self._get_token()
         if not token:
             self.airport_cache[key] = None
@@ -403,6 +528,8 @@ class AmadeusFlightPrices:
             print(f"  ! Amadeus airport lookup for {city.name}: {e}", file=sys.stderr)
             iata = None
         self.airport_cache[key] = iata
+        if self.disk_cache:
+            self.disk_cache.set(disk_key, iata or "")
         return iata
 
     def leg_price(self, mode_name: str, a: City, b: City) -> Optional[float]:
@@ -416,6 +543,12 @@ class AmadeusFlightPrices:
         if not orig or not dest or orig == dest:
             self.price_cache[cache_key] = None
             return None
+        disk_key = f"amadeus_price:{self.currency}:{self.depart_date}:{orig}->{dest}"
+        if self.disk_cache:
+            v = self.disk_cache.get(disk_key)
+            if v is not None:
+                self.price_cache[cache_key] = v if v != "" else None
+                return self.price_cache[cache_key]
         token = self._get_token()
         if not token:
             self.price_cache[cache_key] = None
@@ -442,6 +575,8 @@ class AmadeusFlightPrices:
             print(f"  ! Amadeus flight search {orig}->{dest}: {e}", file=sys.stderr)
             price = None
         self.price_cache[cache_key] = price
+        if self.disk_cache:
+            self.disk_cache.set(disk_key, price if price is not None else "")
         return price
 
 
@@ -538,6 +673,74 @@ def leg_cost(mode: Mode, a: City, b: City, router, prices) -> tuple[float, float
 
 
 # ---------------------------------------------------------------------------
+# Train policy: Interrail pass, Eurostar opt-out, reservations, night trains
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrainPolicy:
+    interrail_pass: bool = False
+    exclude_eurostar: bool = False
+    seat_reservations_ok: bool = True
+    night_trains: str = "exclude"   # "include" | "exclude" | "only"
+    reservation_fee_gbp: float = 5.0
+    sleeper_supplement_gbp: float = 30.0
+    reservation_required_min_km: float = 300.0
+    night_train_min_km: float = 500.0
+
+
+def crosses_channel(a: City, b: City) -> bool:
+    """True iff one endpoint is on the British Isles and the other isn't."""
+    def on_isles(c: City) -> bool:
+        return 49.5 <= c.lat <= 61.0 and -10.5 <= c.lon <= 2.0
+    return on_isles(a) != on_isles(b)
+
+
+def filter_train_modes(modes: list[Mode], policy: TrainPolicy) -> list[Mode]:
+    """Drop Train when only night trains are wanted, drop Night train when excluded."""
+    out: list[Mode] = []
+    for m in modes:
+        if m.name == "Train" and policy.night_trains == "only":
+            continue
+        if m.name == "Night train" and policy.night_trains == "exclude":
+            continue
+        out.append(m)
+    return out
+
+
+def apply_pass_pricing(prices, policy: TrainPolicy) -> None:
+    """Mutate the ConfigPrices inside a PriceStack so Train/Night train per-km
+    is zero (pass covers it) and the per-leg overhead becomes reservation + sleeper."""
+    if not policy.interrail_pass:
+        return
+    config = prices.config
+    if "Train" in config.by_name:
+        config.by_name["Train"].cost_per_km = 0.0
+        config.by_name["Train"].fixed_cost_per_leg = policy.reservation_fee_gbp
+    if "Night train" in config.by_name:
+        config.by_name["Night train"].cost_per_km = 0.0
+        config.by_name["Night train"].fixed_cost_per_leg = (
+            policy.reservation_fee_gbp + policy.sleeper_supplement_gbp
+        )
+
+
+def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy) -> Optional[str]:
+    """Return None if the leg is allowed, else a short reason string."""
+    if mode.name not in ("Train", "Night train"):
+        return None
+    if policy.exclude_eurostar and crosses_channel(a, b):
+        return f"{mode.name}: Eurostar (channel crossing) excluded"
+    distance = haversine_km(a, b) * mode.detour_factor
+    if mode.name == "Train":
+        if not policy.seat_reservations_ok and distance >= policy.reservation_required_min_km:
+            return f"Train: {distance:.0f}km leg needs reservation (--no-reservations set)"
+    if mode.name == "Night train":
+        if distance < policy.night_train_min_km:
+            return f"Night train: {distance:.0f}km leg shorter than {policy.night_train_min_km:.0f}km minimum"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Scheduling: turn an ordered tour into a dated itinerary and check feasibility
 # ---------------------------------------------------------------------------
 
@@ -570,12 +773,19 @@ def _stay_days(opts: ScheduleOpts, name: str) -> int:
 
 
 def compute_schedule(tour: list, cities: list, mode: Mode,
-                     router, prices, opts: ScheduleOpts) -> Schedule:
+                     router, prices, opts: ScheduleOpts,
+                     policy: Optional[TrainPolicy] = None) -> Schedule:
     is_cycle = (opts.end_city is None) or (opts.end_city == opts.start_city) or (opts.end_city == cities[tour[0]].name)
+    policy = policy or TrainPolicy()
 
     distance = travel_h = cost = 0.0
     elapsed_h = 0.0
     stops: list = []
+    fail_reason: Optional[str] = None
+
+    def check_leg(a: City, b: City) -> Optional[str]:
+        r = leg_feasible(mode, a, b, policy)
+        return r
 
     for i, idx in enumerate(tour):
         c = cities[idx]
@@ -594,24 +804,28 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
         elapsed_h = depart_h
         if i + 1 < len(tour):
             nxt = cities[tour[i + 1]]
+            if fail_reason is None:
+                fail_reason = check_leg(c, nxt)
             d, t, k = leg_cost(mode, c, nxt, router, prices)
             distance += d; travel_h += t; cost += k
             elapsed_h += t
 
     if is_cycle and len(tour) > 1:
         first, last = cities[tour[0]], cities[tour[-1]]
+        if fail_reason is None:
+            fail_reason = check_leg(last, first)
         d, t, k = leg_cost(mode, last, first, router, prices)
         distance += d; travel_h += t; cost += k
         elapsed_h += t
 
     total_days = max(1, math.ceil(elapsed_h / 24))
 
-    reason = None
-    if opts.max_days is not None and total_days > opts.max_days:
+    reason = fail_reason
+    if reason is None and opts.max_days is not None and total_days > opts.max_days:
         reason = f"trip is {total_days}d, exceeds max {opts.max_days}d"
-    elif opts.pins and opts.start_date is None:
+    elif reason is None and opts.pins and opts.start_date is None:
         reason = "pins set but no --start-date given"
-    elif opts.pins:
+    elif reason is None and opts.pins:
         by_name = {name: (arr, dep) for name, arr, dep in stops}
         for pin_name, pin_date in opts.pins.items():
             if pin_name not in by_name:
@@ -635,7 +849,8 @@ def _objective(schedule: Schedule, name: str) -> float:
 
 
 def constrained_search(cities: list, mode: Mode, router, prices,
-                       opts: ScheduleOpts, objective: str):
+                       opts: ScheduleOpts, objective: str,
+                       policy: Optional[TrainPolicy] = None):
     """Return (best_tour, best_schedule) or (None, reason_string)."""
     n = len(cities)
     name_to_idx = {c.name: i for i, c in enumerate(cities)}
@@ -648,7 +863,7 @@ def constrained_search(cities: list, mode: Mode, router, prices,
         return [start_idx] + list(perm) + ([end_idx] if is_open_path else [])
 
     def score(perm):
-        return compute_schedule(assemble(perm), cities, mode, router, prices, opts)
+        return compute_schedule(assemble(perm), cities, mode, router, prices, opts, policy)
 
     last_reason = "no feasible tour found"
     best_perm = None
@@ -769,6 +984,47 @@ def fmt_time(hours: float) -> str:
     return f"{h:>3}h {m:02d}m"
 
 
+def find_best_meet(cities: list[City], starters: list[City], mode: Mode,
+                   router, prices, opts: ScheduleOpts, objective: str,
+                   policy: Optional[TrainPolicy] = None):
+    """Pick the destination that minimises (sum of starters' legs to meet) +
+    (joint tour starting at meet). Returns (meet_city, schedule, starter_legs)
+    or (None, last_reason, None)."""
+    import dataclasses
+    best = None
+    best_total = math.inf
+    last_reason = "no feasible meet point + tour"
+    for meet in cities:
+        # check each starter can reach the meet under the policy
+        starter_legs = []
+        bail = None
+        partial_total = 0.0
+        for s in starters:
+            fr = leg_feasible(mode, s, meet, policy or TrainPolicy())
+            if fr:
+                bail = fr
+                break
+            d, t, c = leg_cost(mode, s, meet, router, prices)
+            starter_legs.append({"start": s.name, "distance": d, "time_h": t, "cost": c})
+            partial_total += {"distance": d, "time": t, "cost": c}[objective]
+        if bail:
+            last_reason = bail
+            continue
+        sub_opts = dataclasses.replace(opts, start_city=meet.name)
+        tour, result = constrained_search(cities, mode, router, prices, sub_opts, objective, policy)
+        if tour is None:
+            last_reason = result
+            continue
+        sched = result
+        total = partial_total + _objective(sched, objective)
+        if total < best_total:
+            best_total = total
+            best = (meet, sched, starter_legs)
+    if best is None:
+        return None, last_reason, None
+    return best
+
+
 def _fmt_stop(name: str, arrive: Optional[date], depart: Optional[date]) -> str:
     if arrive is None:
         return name
@@ -778,30 +1034,65 @@ def _fmt_stop(name: str, arrive: Optional[date], depart: Optional[date]) -> str:
 
 
 def report(cities: list[City], modes: list[Mode], router, prices,
-           optimise_for: str, opts: ScheduleOpts) -> None:
+           optimise_for: str, opts: ScheduleOpts,
+           policy: Optional[TrainPolicy] = None,
+           starters: Optional[list[City]] = None,
+           currency: str = "GBP") -> None:
     is_open_path = bool(opts.end_city) and opts.end_city != (opts.start_city or cities[0].name)
+    sym = currency_symbol(currency)
     print(f"Cities ({len(cities)}): " + ", ".join(c.name for c in cities))
-    print(f"Start: {opts.start_city or cities[0].name}"
-          + (f"   End: {opts.end_city}" if is_open_path else "   (closed loop)")
-          + (f"   Start date: {opts.start_date.isoformat()}" if opts.start_date else "")
-          + (f"   Max days: {opts.max_days}" if opts.max_days else ""))
+    if starters:
+        print(f"Starting from ({len(starters)}): " + ", ".join(s.name for s in starters))
+        print("Best meeting point picked per mode below.")
+    else:
+        print(f"Start: {opts.start_city or cities[0].name}"
+              + (f"   End: {opts.end_city}" if is_open_path else "   (closed loop)"))
+    extras = []
+    if opts.start_date: extras.append(f"Start date: {opts.start_date.isoformat()}")
+    if opts.max_days: extras.append(f"Max days: {opts.max_days}")
+    if extras: print("   ".join(extras))
     if opts.pins:
         print("Pins: " + ", ".join(f"{n}@{d.isoformat()}" for n, d in opts.pins.items()))
-    print(f"Optimising each tour for: {optimise_for}\n")
-    header = f"{'Mode':<10} {'Distance':>10} {'Travel':>10} {'Cost':>10} {'Days':>6}   Itinerary"
+    if policy and (policy.interrail_pass or policy.exclude_eurostar
+                   or not policy.seat_reservations_ok or policy.night_trains != "exclude"):
+        bits = []
+        if policy.interrail_pass: bits.append("Interrail pass")
+        if policy.exclude_eurostar: bits.append("no Eurostar")
+        if not policy.seat_reservations_ok: bits.append("no reservations")
+        if policy.night_trains != "exclude": bits.append(f"night trains: {policy.night_trains}")
+        print("Rail policy: " + ", ".join(bits))
+    print(f"Currency: {currency} ({sym})   Optimising each tour for: {optimise_for}\n")
+    header = f"{'Mode':<12} {'Distance':>10} {'Travel':>10} {'Cost':>11} {'Days':>6}   Itinerary"
     print(header)
     print("-" * len(header))
     for mode in modes:
-        tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for)
-        if tour is None:
-            print(f"{mode.name:<10} {'-':>10} {'-':>10} {'-':>10} {'-':>6}   infeasible: {result}")
+        if starters:
+            meet, sched, starter_legs = find_best_meet(
+                cities, starters, mode, router, prices, opts, optimise_for, policy)
+            if meet is None:
+                print(f"{mode.name:<12} {'-':>10} {'-':>10} {'-':>11} {'-':>6}   infeasible: {sched}")
+                continue
+            # tour starts at meet.name; show that first plus the joint tour
+            joint_names = " -> ".join(_fmt_stop(*s) for s in sched.stops)
+            if not is_open_path:
+                joint_names += f" -> {sched.stops[0][0]}"
+            starter_str = ", ".join(f"{l['start']}->{meet.name} {l['distance']:.0f}km/{fmt_time(l['time_h']).strip()}" for l in starter_legs)
+            total_starter_cost = sum(l["cost"] for l in starter_legs)
+            total_cost = sched.cost + total_starter_cost
+            print(f"{mode.name:<12} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
+                  f"{sym}{total_cost:>9.2f} {sched.total_days:>5}d   meet at {meet.name} "
+                  f"[{starter_str}] then {joint_names}")
             continue
-        sched: Schedule = result
+        tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for, policy)
+        if tour is None:
+            print(f"{mode.name:<12} {'-':>10} {'-':>10} {'-':>11} {'-':>6}   infeasible: {result}")
+            continue
+        sched = result
         names = " -> ".join(_fmt_stop(*s) for s in sched.stops)
         if not is_open_path:
             names += f" -> {sched.stops[0][0]}"
-        print(f"{mode.name:<10} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
-              f"£{sched.cost:>8.2f} {sched.total_days:>5}d   {names}")
+        print(f"{mode.name:<12} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
+              f"{sym}{sched.cost:>9.2f} {sched.total_days:>5}d   {names}")
 
 
 # ---------------------------------------------------------------------------
@@ -809,37 +1100,42 @@ def report(cities: list[City], modes: list[Mode], router, prices,
 # ---------------------------------------------------------------------------
 
 
-def build_geocoder(name: str, google_key: Optional[str]):
+def build_geocoder(name: str, google_key: Optional[str], cache: Optional[JsonCache] = None):
     local = LocalGazetteer()
+    def wrap(g):
+        return CachedGeocoder(g, cache) if (cache and cache.enabled and type(g) is not LocalGazetteer) else g
     if name == "local":
         return local
     if name == "nominatim":
-        return FallbackGeocoder(NominatimGeocoder(), local)
+        return FallbackGeocoder(wrap(NominatimGeocoder()), local)
     if name == "google":
         if not google_key:
             print("--geocoder google needs --google-key or $GOOGLE_MAPS_API_KEY; "
                   "falling back to Nominatim.", file=sys.stderr)
-            return FallbackGeocoder(NominatimGeocoder(), local)
-        return FallbackGeocoder(GoogleGeocoder(google_key), NominatimGeocoder(), local)
+            return FallbackGeocoder(wrap(NominatimGeocoder()), local)
+        return FallbackGeocoder(wrap(GoogleGeocoder(google_key)),
+                                wrap(NominatimGeocoder()), local)
     raise ValueError(f"unknown geocoder {name}")
 
 
-def build_router(name: str, google_key: Optional[str]):
+def build_router(name: str, google_key: Optional[str], cache: Optional[JsonCache] = None):
     hav = HaversineRouter()
     if name == "haversine":
-        return hav
+        return hav  # deterministic + fast, no caching needed
     if name == "google":
         if not google_key:
             print("--router google needs --google-key or $GOOGLE_MAPS_API_KEY; "
                   "falling back to haversine.", file=sys.stderr)
             return hav
-        return GoogleRoutesRouter(google_key, hav)
+        google = GoogleRoutesRouter(google_key, hav)
+        return CachedRouter(google, cache) if (cache and cache.enabled) else google
     raise ValueError(f"unknown router {name}")
 
 
 def build_prices(modes, prices_file, *, serpapi_key=None, amadeus_key=None,
                  amadeus_secret=None, amadeus_prod=False, depart_date=None,
-                 enable_scrapers=False):
+                 enable_scrapers=False, currency: str = "GBP",
+                 cache: Optional[JsonCache] = None):
     config = ConfigPrices(modes, overrides_file=prices_file)
     scraped = None
     if enable_scrapers and prices_file and os.path.exists(prices_file):
@@ -856,12 +1152,14 @@ def build_prices(modes, prices_file, *, serpapi_key=None, amadeus_key=None,
     else:
         if amadeus_key and amadeus_secret and depart_date:
             flights.append(AmadeusFlightPrices(amadeus_key, amadeus_secret, depart_date,
-                                               use_prod=amadeus_prod))
+                                               currency=currency, use_prod=amadeus_prod,
+                                               cache=cache))
         elif amadeus_key and not amadeus_secret:
             print("--amadeus-key given without --amadeus-secret; skipping Amadeus.",
                   file=sys.stderr)
         if serpapi_key and depart_date:
-            flights.append(SerpApiFlightPrices(serpapi_key, depart_date))
+            flights.append(SerpApiFlightPrices(serpapi_key, depart_date,
+                                               currency=currency, cache=cache))
     return PriceStack(config, scraped=scraped, flights=flights)
 
 
@@ -906,11 +1204,44 @@ def main():
                        metavar="CITY=YYYY-MM-DD",
                        help="require being in CITY on the given date (repeatable)")
 
+    rail = p.add_argument_group("rail policy")
+    rail.add_argument("--interrail", "--interrail-pass", dest="interrail",
+                      action="store_true",
+                      help="treat Train (and Night train) as covered by an Interrail pass: "
+                           "per-km cost goes to 0, plus a small per-leg reservation fee")
+    rail.add_argument("--exclude-eurostar", action="store_true",
+                      help="exclude Train legs that cross the English Channel")
+    rail.add_argument("--no-reservations", action="store_true",
+                      help="exclude Train legs that likely require a seat reservation")
+    rail.add_argument("--night-trains", choices=["include", "exclude", "only"],
+                      default="exclude",
+                      help='night-train mode: "exclude" (default) hides Night train; '
+                           '"include" shows both Train and Night train; '
+                           '"only" hides regular Train')
+
+    grp = p.add_argument_group("group travel")
+    grp.add_argument("--meet-from", action="append", default=[], metavar="CITY",
+                     help="city someone is starting from (repeatable); the solver picks "
+                          "the best destination as the meeting point per mode")
+
+    misc = p.add_argument_group("misc")
+    misc.add_argument("--currency", default="GBP",
+                      help="display currency and the one passed to flight APIs (e.g. GBP, EUR, USD)")
+    misc.add_argument("--cache-file", default=os.path.join(os.path.expanduser("~"),
+                                                           ".tsp-tool-cache.json"),
+                      help="path to on-disk cache (JSON)")
+    misc.add_argument("--cache-ttl", type=int, default=86400,
+                      help="cache entry lifetime in seconds (default 24h)")
+    misc.add_argument("--no-cache", action="store_true",
+                      help="disable on-disk caching")
+
     p.add_argument("--optimise", choices=["distance", "time", "cost"], default="time")
     args = p.parse_args()
 
-    geocoder = build_geocoder(args.geocoder, args.google_key)
-    router = build_router(args.router, args.google_key)
+    cache = JsonCache(path=args.cache_file, ttl_seconds=args.cache_ttl,
+                      enabled=not args.no_cache)
+    geocoder = build_geocoder(args.geocoder, args.google_key, cache)
+    router = build_router(args.router, args.google_key, cache)
     prices = build_prices(
         DEFAULT_MODES, args.prices_file,
         serpapi_key=args.serpapi_key,
@@ -919,6 +1250,8 @@ def main():
         amadeus_prod=args.amadeus_prod,
         depart_date=args.depart_date,
         enable_scrapers=args.enable_scrapers,
+        currency=args.currency,
+        cache=cache,
     )
 
     cities: list[City] = []
@@ -979,7 +1312,24 @@ def main():
         end_city=args.end_city,
     )
 
-    report(cities, DEFAULT_MODES, router, prices, args.optimise, opts)
+    policy = TrainPolicy(
+        interrail_pass=args.interrail,
+        exclude_eurostar=args.exclude_eurostar,
+        seat_reservations_ok=not args.no_reservations,
+        night_trains=args.night_trains,
+    )
+    apply_pass_pricing(prices, policy)
+    modes = filter_train_modes(DEFAULT_MODES, policy)
+
+    starters: list[City] = []
+    for name in args.meet_from:
+        c = resolve_city(name, geocoder)
+        if c is None:
+            print(f"could not geocode --meet-from {name!r}", file=sys.stderr); sys.exit(2)
+        starters.append(c)
+
+    report(cities, modes, router, prices, args.optimise, opts, policy,
+           starters=starters or None, currency=args.currency)
 
 
 if __name__ == "__main__":

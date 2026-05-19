@@ -24,19 +24,105 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const readline = require('readline');
+
+// ---------------------------------------------------------------------------
+// Disk cache + caching wrappers
+// ---------------------------------------------------------------------------
+
+class JsonCache {
+  constructor({ filePath = null, ttlSeconds = 86400, enabled = true } = {}) {
+    this.path = filePath || path.join(os.homedir(), '.tsp-tool-cache.json');
+    this.ttl = ttlSeconds;
+    this.enabled = enabled;
+    this.data = {};
+    if (enabled) {
+      try { this.data = JSON.parse(fs.readFileSync(this.path, 'utf8')); }
+      catch (e) { if (e.code !== 'ENOENT') console.error(`cache load: ${e.message}`); }
+    }
+  }
+  get(key) {
+    if (!this.enabled) return undefined;
+    const e = this.data[key];
+    if (!e) return undefined;
+    if ((Date.now() / 1000) - (e.ts || 0) > this.ttl) return undefined;
+    return e.v;
+  }
+  set(key, value) {
+    if (!this.enabled) return;
+    this.data[key] = { ts: Date.now() / 1000, v: value };
+    try {
+      const tmp = this.path + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(this.data));
+      fs.renameSync(tmp, this.path);
+    } catch (e) { console.error(`cache save: ${e.message}`); }
+  }
+}
+
+class CachedGeocoder {
+  constructor(inner, cache) { this.inner = inner; this.cache = cache; }
+  async geocode(name) {
+    const key = `geo:${this.inner.constructor.name}:${name.trim().toLowerCase()}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return cached && cached.lat != null ? cached : null;
+    }
+    const r = await this.inner.geocode(name);
+    this.cache.set(key, r || null);
+    return r;
+  }
+}
+
+class CachedRouter {
+  constructor(inner, cache) { this.inner = inner; this.cache = cache; }
+  async route(mode, a, b) {
+    const key = `route:${this.inner.constructor.name}:${mode.name}:`
+      + `${a.lat.toFixed(4)},${a.lon.toFixed(4)}->${b.lat.toFixed(4)},${b.lon.toFixed(4)}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) return cached;
+    const r = await this.inner.route(mode, a, b);
+    this.cache.set(key, r);
+    return r;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
 
+function makeMode(name, detourFactor, avgSpeedKmh, costPerKm,
+                  terminalAccessH, boardingWaitH, terminalEgressH, fixedCostPerLeg) {
+  const m = { name, detourFactor, avgSpeedKmh, costPerKm,
+              terminalAccessH, boardingWaitH, terminalEgressH, fixedCostPerLeg };
+  Object.defineProperty(m, 'fixedTimePerLegH', {
+    enumerable: true,
+    get() { return this.terminalAccessH + this.boardingWaitH + this.terminalEgressH; },
+    set(v) { this.terminalAccessH = 0; this.terminalEgressH = 0; this.boardingWaitH = +v; },
+  });
+  return m;
+}
+
 const DEFAULT_MODES = [
-  { name: 'ICE car', detourFactor: 1.30, avgSpeedKmh: 90,  costPerKm: 0.15, fixedTimePerLegH: 0.00, fixedCostPerLeg: 0  },
-  { name: 'EV car',  detourFactor: 1.30, avgSpeedKmh: 90,  costPerKm: 0.05, fixedTimePerLegH: 0.00, fixedCostPerLeg: 0  },
-  { name: 'Coach',   detourFactor: 1.35, avgSpeedKmh: 65,  costPerKm: 0.04, fixedTimePerLegH: 0.25, fixedCostPerLeg: 1  },
-  { name: 'Train',   detourFactor: 1.20, avgSpeedKmh: 120, costPerKm: 0.12, fixedTimePerLegH: 0.25, fixedCostPerLeg: 2  },
-  { name: 'Flight',  detourFactor: 1.00, avgSpeedKmh: 700, costPerKm: 0.20, fixedTimePerLegH: 2.50, fixedCostPerLeg: 30 },
+  //         name           detour avgKmh £/km access wait  egress fixed
+  makeMode('ICE car',     1.30,  90,    0.15, 0.00, 0.00, 0.00, 0),
+  makeMode('EV car',      1.30,  90,    0.05, 0.00, 0.00, 0.00, 0),
+  makeMode('Coach',       1.35,  65,    0.04, 0.25, 0.25, 0.25, 1),
+  makeMode('Train',       1.20, 120,    0.12, 0.25, 0.25, 0.25, 2),
+  makeMode('Night train', 1.20,  80,    0.10, 0.25, 0.50, 0.25, 30),
+  makeMode('Flight',      1.00, 700,    0.20, 0.75, 2.00, 0.75, 30),
 ];
+
+const CURRENCY_SYMBOLS = {
+  GBP: '£', EUR: '€', USD: '$', CAD: 'C$', AUD: 'A$', NZD: 'NZ$',
+  JPY: '¥', CNY: '¥', INR: '₹', CHF: 'CHF', SEK: 'kr', NOK: 'kr',
+  DKK: 'kr', PLN: 'zł', CZK: 'Kč', HUF: 'Ft',
+};
+
+function currencySymbol(code) {
+  return CURRENCY_SYMBOLS[code.toUpperCase()] || (code.toUpperCase() + ' ');
+}
 
 const DEFAULT_CITIES = [
   { name: 'London',     lat: 51.5074, lon: -0.1278 },
@@ -217,7 +303,10 @@ class GoogleRoutesRouter {
 
 class ConfigPrices {
   constructor(modes, overridesFile) {
-    this.byName = Object.fromEntries(modes.map((m) => [m.name, { ...m }]));
+    this.byName = Object.fromEntries(modes.map((m) => [m.name,
+      makeMode(m.name, m.detourFactor, m.avgSpeedKmh, m.costPerKm,
+               m.terminalAccessH, m.boardingWaitH, m.terminalEgressH, m.fixedCostPerLeg),
+    ]));
     if (overridesFile && fs.existsSync(overridesFile)) {
       const data = JSON.parse(fs.readFileSync(overridesFile, 'utf8'));
       const overrides = (data && data.modes) || {};
@@ -233,16 +322,26 @@ class ConfigPrices {
 }
 
 class SerpApiFlightPrices {
-  constructor(apiKey, departDate, currency = 'GBP') {
+  constructor(apiKey, departDate, { currency = 'GBP', cache = null } = {}) {
     this.apiKey = apiKey;
     this.departDate = departDate;
     this.currency = currency;
-    this.cache = new Map();
+    this.memCache = new Map();
+    this.diskCache = cache;
   }
   async legPrice(modeName, a, b) {
     if (modeName !== 'Flight') return null;
     const key = `${a.name}|${b.name}`;
-    if (this.cache.has(key)) return this.cache.get(key);
+    if (this.memCache.has(key)) return this.memCache.get(key);
+    const diskKey = `serpapi:${this.currency}:${this.departDate}:${a.name}->${b.name}`;
+    if (this.diskCache) {
+      const v = this.diskCache.get(diskKey);
+      if (v !== undefined) {
+        const value = v === '' ? null : v;
+        this.memCache.set(key, value);
+        return value;
+      }
+    }
     const params = new URLSearchParams({
       engine: 'google_flights',
       departure_id: a.name,
@@ -252,20 +351,19 @@ class SerpApiFlightPrices {
       currency: this.currency,
       api_key: this.apiKey,
     });
+    let price = null;
     try {
       const data = await httpGetJson(`https://serpapi.com/search?${params.toString()}`, { timeoutMs: 20000 });
       const flights = (data.best_flights && data.best_flights.length ? data.best_flights : data.other_flights) || [];
-      let price = null;
       for (const f of flights) {
         if (f.price != null) { price = Number(f.price); break; }
       }
-      this.cache.set(key, price);
-      return price;
     } catch (e) {
       console.error(`  ! SerpAPI flights ${a.name}->${b.name}: ${e.message}`);
-      this.cache.set(key, null);
-      return null;
     }
+    this.memCache.set(key, price);
+    if (this.diskCache) this.diskCache.set(diskKey, price == null ? '' : price);
+    return price;
   }
 }
 
@@ -279,7 +377,8 @@ class AmadeusFlightPrices {
   static TEST_BASE = 'https://test.api.amadeus.com';
   static PROD_BASE = 'https://api.amadeus.com';
 
-  constructor(apiKey, apiSecret, departDate, { currency = 'GBP', useProd = false } = {}) {
+  constructor(apiKey, apiSecret, departDate,
+              { currency = 'GBP', useProd = false, cache = null } = {}) {
     this.apiKey = apiKey;
     this.apiSecret = apiSecret;
     this.departDate = departDate;
@@ -289,6 +388,7 @@ class AmadeusFlightPrices {
     this.tokenExpiresAt = 0;
     this.airportCache = new Map();
     this.priceCache = new Map();
+    this.diskCache = cache;
   }
 
   async _getToken() {
@@ -328,6 +428,16 @@ class AmadeusFlightPrices {
   async _nearestAirport(city) {
     const key = `${city.lat.toFixed(3)},${city.lon.toFixed(3)}`;
     if (this.airportCache.has(key)) return this.airportCache.get(key);
+    const diskKey = `amadeus_airport:${key}`;
+    if (this.diskCache) {
+      const v = this.diskCache.get(diskKey);
+      if (v !== undefined) {
+        const value = v === '' ? null : v;
+        this.airportCache.set(key, value);
+        return value;
+      }
+    }
+    let iata = null;
     try {
       const data = await this._authedGet('/v1/reference-data/locations/airports', {
         latitude: city.lat.toFixed(4),
@@ -337,14 +447,13 @@ class AmadeusFlightPrices {
         sort: 'relevance',
       });
       const results = (data && data.data) || [];
-      const iata = results[0] ? results[0].iataCode : null;
-      this.airportCache.set(key, iata);
-      return iata;
+      iata = results[0] ? results[0].iataCode : null;
     } catch (e) {
       console.error(`  ! Amadeus airport lookup for ${city.name}: ${e.message}`);
-      this.airportCache.set(key, null);
-      return null;
     }
+    this.airportCache.set(key, iata);
+    if (this.diskCache) this.diskCache.set(diskKey, iata || '');
+    return iata;
   }
 
   async legPrice(modeName, a, b) {
@@ -353,6 +462,16 @@ class AmadeusFlightPrices {
     if (this.priceCache.has(cacheKey)) return this.priceCache.get(cacheKey);
     const [orig, dest] = await Promise.all([this._nearestAirport(a), this._nearestAirport(b)]);
     if (!orig || !dest || orig === dest) { this.priceCache.set(cacheKey, null); return null; }
+    const diskKey = `amadeus_price:${this.currency}:${this.departDate}:${orig}->${dest}`;
+    if (this.diskCache) {
+      const v = this.diskCache.get(diskKey);
+      if (v !== undefined) {
+        const value = v === '' ? null : v;
+        this.priceCache.set(cacheKey, value);
+        return value;
+      }
+    }
+    let price = null;
     try {
       const data = await this._authedGet('/v2/shopping/flight-offers', {
         originLocationCode: orig,
@@ -364,14 +483,13 @@ class AmadeusFlightPrices {
         nonStop: 'false',
       });
       const offers = (data && data.data) || [];
-      const price = offers[0] ? Number(offers[0].price.grandTotal) : null;
-      this.priceCache.set(cacheKey, price);
-      return price;
+      price = offers[0] ? Number(offers[0].price.grandTotal) : null;
     } catch (e) {
       console.error(`  ! Amadeus flight search ${orig}->${dest}: ${e.message}`);
-      this.priceCache.set(cacheKey, null);
-      return null;
     }
+    this.priceCache.set(cacheKey, price);
+    if (this.diskCache) this.diskCache.set(diskKey, price == null ? '' : price);
+    return price;
   }
 }
 
@@ -439,6 +557,63 @@ async function legCost(mode, a, b, router, prices) {
 }
 
 // ---------------------------------------------------------------------------
+// Train policy: Interrail pass, Eurostar opt-out, reservations, night trains
+// ---------------------------------------------------------------------------
+
+const DEFAULT_TRAIN_POLICY = {
+  interrailPass: false,
+  excludeEurostar: false,
+  seatReservationsOk: true,
+  nightTrains: 'exclude', // 'include' | 'exclude' | 'only'
+  reservationFeeGbp: 5,
+  sleeperSupplementGbp: 30,
+  reservationRequiredMinKm: 300,
+  nightTrainMinKm: 500,
+};
+
+function crossesChannel(a, b) {
+  const onIsles = (c) => c.lat >= 49.5 && c.lat <= 61.0 && c.lon >= -10.5 && c.lon <= 2.0;
+  return onIsles(a) !== onIsles(b);
+}
+
+function filterTrainModes(modes, policy) {
+  return modes.filter((m) => {
+    if (m.name === 'Train' && policy.nightTrains === 'only') return false;
+    if (m.name === 'Night train' && policy.nightTrains === 'exclude') return false;
+    return true;
+  });
+}
+
+function applyPassPricing(prices, policy) {
+  if (!policy.interrailPass) return;
+  const cfg = prices.config.byName;
+  if (cfg.Train) {
+    cfg.Train.costPerKm = 0;
+    cfg.Train.fixedCostPerLeg = policy.reservationFeeGbp;
+  }
+  if (cfg['Night train']) {
+    cfg['Night train'].costPerKm = 0;
+    cfg['Night train'].fixedCostPerLeg = policy.reservationFeeGbp + policy.sleeperSupplementGbp;
+  }
+}
+
+function legFeasible(mode, a, b, policy) {
+  if (mode.name !== 'Train' && mode.name !== 'Night train') return null;
+  if (policy.excludeEurostar && crossesChannel(a, b)) {
+    return `${mode.name}: Eurostar (channel crossing) excluded`;
+  }
+  const distance = haversineKm(a, b) * mode.detourFactor;
+  if (mode.name === 'Train' && !policy.seatReservationsOk
+      && distance >= policy.reservationRequiredMinKm) {
+    return `Train: ${distance.toFixed(0)}km leg needs reservation (--no-reservations set)`;
+  }
+  if (mode.name === 'Night train' && distance < policy.nightTrainMinKm) {
+    return `Night train: ${distance.toFixed(0)}km leg shorter than ${policy.nightTrainMinKm}km minimum`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Scheduling: turn an ordered tour into a dated itinerary, check feasibility
 // ---------------------------------------------------------------------------
 
@@ -474,11 +649,13 @@ function* permutations(arr) {
   }
 }
 
-async function computeSchedule(tour, cities, mode, router, prices, opts) {
+async function computeSchedule(tour, cities, mode, router, prices, opts, policy) {
+  policy = policy || DEFAULT_TRAIN_POLICY;
   const startName = opts.startCity || cities[tour[0]].name;
   const isOpenPath = !!opts.endCity && opts.endCity !== startName;
   let distance = 0, travelH = 0, cost = 0, elapsedH = 0;
   const stops = [];
+  let failReason = null;
 
   for (let i = 0; i < tour.length; i++) {
     const c = cities[tour[i]];
@@ -495,6 +672,7 @@ async function computeSchedule(tour, cities, mode, router, prices, opts) {
     elapsedH = departH;
     if (i + 1 < tour.length) {
       const nxt = cities[tour[i + 1]];
+      if (failReason === null) failReason = legFeasible(mode, c, nxt, policy);
       const leg = await legCost(mode, c, nxt, router, prices);
       distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
       elapsedH += leg.timeH;
@@ -503,6 +681,7 @@ async function computeSchedule(tour, cities, mode, router, prices, opts) {
 
   if (!isOpenPath && tour.length > 1) {
     const first = cities[tour[0]], last = cities[tour[tour.length - 1]];
+    if (failReason === null) failReason = legFeasible(mode, last, first, policy);
     const leg = await legCost(mode, last, first, router, prices);
     distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
     elapsedH += leg.timeH;
@@ -510,12 +689,12 @@ async function computeSchedule(tour, cities, mode, router, prices, opts) {
 
   const totalDays = Math.max(1, Math.ceil(elapsedH / 24));
 
-  let reason = null;
-  if (opts.maxDays != null && totalDays > opts.maxDays) {
+  let reason = failReason;
+  if (reason === null && opts.maxDays != null && totalDays > opts.maxDays) {
     reason = `trip is ${totalDays}d, exceeds max ${opts.maxDays}d`;
-  } else if (opts.pins && Object.keys(opts.pins).length && !opts.startDate) {
+  } else if (reason === null && opts.pins && Object.keys(opts.pins).length && !opts.startDate) {
     reason = 'pins set but no startDate given';
-  } else if (opts.pins) {
+  } else if (reason === null && opts.pins) {
     const byName = Object.fromEntries(stops.map((s) => [s.name, s]));
     for (const [pn, pd] of Object.entries(opts.pins)) {
       const s = byName[pn];
@@ -538,7 +717,7 @@ function pickObjective(sched, name) {
   return name === 'distance' ? sched.distance : name === 'time' ? sched.travelH : sched.cost;
 }
 
-async function constrainedSearch(cities, mode, router, prices, opts, objective) {
+async function constrainedSearch(cities, mode, router, prices, opts, objective, policy) {
   const n = cities.length;
   const nameToIdx = new Map(cities.map((c, i) => [c.name, i]));
   const startIdx = nameToIdx.get(opts.startCity) ?? 0;
@@ -562,7 +741,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective) 
 
   if (factorial(middle.length) <= 40320) {
     for (const perm of permutations(middle)) {
-      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts);
+      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts, policy);
       consider(perm, sched);
     }
   } else {
@@ -593,7 +772,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective) 
 
   async function twoOptConstrained(perm) {
     let cur = perm.slice();
-    let curSched = await computeSchedule(assemble(cur), cities, mode, router, prices, opts);
+    let curSched = await computeSchedule(assemble(cur), cities, mode, router, prices, opts, policy);
     let curVal = curSched.feasible ? pickObjective(curSched, objective) : Infinity;
     let improved = true;
     while (improved) {
@@ -601,7 +780,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective) 
       for (let i = 0; i < cur.length - 1; i++) {
         for (let j = i + 1; j < cur.length; j++) {
           const cand = cur.slice(0, i).concat(cur.slice(i, j + 1).reverse(), cur.slice(j + 1));
-          const candSched = await computeSchedule(assemble(cand), cities, mode, router, prices, opts);
+          const candSched = await computeSchedule(assemble(cand), cities, mode, router, prices, opts, policy);
           if (!candSched.feasible) continue;
           const v = pickObjective(candSched, objective);
           if (v + 1e-9 < curVal) { cur = cand; curSched = candSched; curVal = v; improved = true; }
@@ -688,41 +867,103 @@ function fmtTime(hours) {
   return `${String(h).padStart(3)}h ${String(m).padStart(2, '0')}m`;
 }
 
+async function findBestMeet(cities, starters, mode, router, prices, opts, objective, policy) {
+  let best = null;
+  let bestTotal = Infinity;
+  let lastReason = 'no feasible meet point + tour';
+  for (const meet of cities) {
+    let bail = null;
+    const starterLegs = [];
+    let partialTotal = 0;
+    for (const s of starters) {
+      const fr = legFeasible(mode, s, meet, policy || DEFAULT_TRAIN_POLICY);
+      if (fr) { bail = fr; break; }
+      const { distance, timeH, cost } = await legCost(mode, s, meet, router, prices);
+      starterLegs.push({ start: s.name, distance, timeH, cost });
+      partialTotal += objective === 'distance' ? distance : objective === 'time' ? timeH : cost;
+    }
+    if (bail) { lastReason = bail; continue; }
+    const subOpts = { ...opts, startCity: meet.name };
+    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, subOpts, objective, policy);
+    if (!tour) { lastReason = reason; continue; }
+    const total = partialTotal + pickObjective(sched, objective);
+    if (total < bestTotal) { bestTotal = total; best = { meet, sched, starterLegs }; }
+  }
+  return best ? best : { meet: null, sched: null, starterLegs: null, reason: lastReason };
+}
+
 function fmtStop(stop) {
   if (!stop.arrive) return stop.name;
   if (stop.arrive.getTime() === stop.depart.getTime()) return `${stop.name}(${fmtMonDay(stop.arrive)})`;
   return `${stop.name}(${fmtMonDay(stop.arrive)}-${fmtMonDay(stop.depart)})`;
 }
 
-async function report(cities, modes, router, prices, optimiseFor, opts) {
+async function report(cities, modes, router, prices, optimiseFor, opts, policy,
+                      { starters = null, currency = 'GBP' } = {}) {
+  const sym = currencySymbol(currency);
   const startName = opts.startCity || cities[0].name;
   const isOpenPath = !!opts.endCity && opts.endCity !== startName;
   console.log(`Cities (${cities.length}): ${cities.map((c) => c.name).join(', ')}`);
-  let line = `Start: ${startName}` + (isOpenPath ? `   End: ${opts.endCity}` : '   (closed loop)');
-  if (opts.startDate) line += `   Start date: ${isoDate(opts.startDate)}`;
-  if (opts.maxDays != null) line += `   Max days: ${opts.maxDays}`;
-  console.log(line);
+  if (starters && starters.length) {
+    console.log(`Starting from (${starters.length}): ${starters.map((s) => s.name).join(', ')}`);
+    console.log('Best meeting point picked per mode below.');
+  } else {
+    console.log(`Start: ${startName}` + (isOpenPath ? `   End: ${opts.endCity}` : '   (closed loop)'));
+  }
+  const extras = [];
+  if (opts.startDate) extras.push(`Start date: ${isoDate(opts.startDate)}`);
+  if (opts.maxDays != null) extras.push(`Max days: ${opts.maxDays}`);
+  if (extras.length) console.log(extras.join('   '));
   if (opts.pins && Object.keys(opts.pins).length) {
     console.log('Pins: ' + Object.entries(opts.pins).map(([n, d]) => `${n}@${isoDate(d)}`).join(', '));
   }
-  console.log(`Optimising each tour for: ${optimiseFor}\n`);
-  const header = `${'Mode'.padEnd(10)} ${'Distance'.padStart(10)} ${'Travel'.padStart(10)} ${'Cost'.padStart(10)} ${'Days'.padStart(6)}   Itinerary`;
+  if (policy && (policy.interrailPass || policy.excludeEurostar
+                 || !policy.seatReservationsOk || policy.nightTrains !== 'exclude')) {
+    const bits = [];
+    if (policy.interrailPass) bits.push('Interrail pass');
+    if (policy.excludeEurostar) bits.push('no Eurostar');
+    if (!policy.seatReservationsOk) bits.push('no reservations');
+    if (policy.nightTrains !== 'exclude') bits.push(`night trains: ${policy.nightTrains}`);
+    console.log('Rail policy: ' + bits.join(', '));
+  }
+  console.log(`Currency: ${currency} (${sym})   Optimising each tour for: ${optimiseFor}\n`);
+  const header = `${'Mode'.padEnd(12)} ${'Distance'.padStart(10)} ${'Travel'.padStart(10)} ${'Cost'.padStart(11)} ${'Days'.padStart(6)}   Itinerary`;
   console.log(header);
   console.log('-'.repeat(header.length));
+  const dash = (w) => '-'.padStart(w);
   for (const mode of modes) {
-    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, opts, optimiseFor);
+    if (starters && starters.length) {
+      const r = await findBestMeet(cities, starters, mode, router, prices, opts, optimiseFor, policy);
+      if (!r.meet) {
+        console.log(`${mode.name.padEnd(12)} ${dash(10)} ${dash(10)} ${dash(11)} ${dash(6)}   infeasible: ${r.reason}`);
+        continue;
+      }
+      const { meet, sched, starterLegs } = r;
+      let joint = sched.stops.map(fmtStop).join(' -> ');
+      if (!isOpenPath) joint += ` -> ${sched.stops[0].name}`;
+      const starterStr = starterLegs.map((l) =>
+        `${l.start}->${meet.name} ${l.distance.toFixed(0)}km/${fmtTime(l.timeH).trim()}`).join(', ');
+      const totalStarter = starterLegs.reduce((s, l) => s + l.cost, 0);
+      const totalCost = sched.cost + totalStarter;
+      const dist = `${sched.distance.toFixed(0)}km`.padStart(10);
+      const time = fmtTime(sched.travelH).padStart(10);
+      const cost = `${sym}${totalCost.toFixed(2)}`.padStart(11);
+      const days = `${sched.totalDays}d`.padStart(6);
+      console.log(`${mode.name.padEnd(12)} ${dist} ${time} ${cost} ${days}   meet at ${meet.name} [${starterStr}] then ${joint}`);
+      continue;
+    }
+    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, opts, optimiseFor, policy);
     if (!tour) {
-      const dash = (w) => '-'.padStart(w);
-      console.log(`${mode.name.padEnd(10)} ${dash(10)} ${dash(10)} ${dash(10)} ${dash(6)}   infeasible: ${reason}`);
+      console.log(`${mode.name.padEnd(12)} ${dash(10)} ${dash(10)} ${dash(11)} ${dash(6)}   infeasible: ${reason}`);
       continue;
     }
     let names = sched.stops.map(fmtStop).join(' -> ');
     if (!isOpenPath) names += ` -> ${sched.stops[0].name}`;
     const dist = `${sched.distance.toFixed(0)}km`.padStart(10);
     const time = fmtTime(sched.travelH).padStart(10);
-    const cost = `£${sched.cost.toFixed(2)}`.padStart(10);
+    const cost = `${sym}${sched.cost.toFixed(2)}`.padStart(11);
     const days = `${sched.totalDays}d`.padStart(6);
-    console.log(`${mode.name.padEnd(10)} ${dist} ${time} ${cost} ${days}   ${names}`);
+    console.log(`${mode.name.padEnd(12)} ${dist} ${time} ${cost} ${days}   ${names}`);
   }
 }
 
@@ -743,6 +984,12 @@ function parseArgs(argv) {
     departDate: null,
     startCity: null, endCity: null, startDate: null,
     maxDays: null, daysPerCity: 1, stays: [], pins: [],
+    interrail: false, excludeEurostar: false, noReservations: false,
+    nightTrains: 'exclude',
+    meetFrom: [],
+    currency: 'GBP',
+    cacheFile: path.join(os.homedir(), '.tsp-tool-cache.json'),
+    cacheTtl: 86400, noCache: false,
     optimise: 'time',
   };
   for (let i = 0; i < argv.length; i++) {
@@ -769,6 +1016,15 @@ function parseArgs(argv) {
       case '--days-per-city': out.daysPerCity = parseInt(next(), 10); break;
       case '--stay': out.stays.push(next()); break;
       case '--pin': out.pins.push(next()); break;
+      case '--interrail': case '--interrail-pass': out.interrail = true; break;
+      case '--exclude-eurostar': out.excludeEurostar = true; break;
+      case '--no-reservations': out.noReservations = true; break;
+      case '--night-trains': out.nightTrains = next(); break;
+      case '--meet-from': out.meetFrom.push(next()); break;
+      case '--currency': out.currency = next(); break;
+      case '--cache-file': out.cacheFile = next(); break;
+      case '--cache-ttl': out.cacheTtl = parseInt(next(), 10); break;
+      case '--no-cache': out.noCache = true; break;
       case '--optimise': out.optimise = next(); break;
       case '-h': case '--help':
         console.log('see file header for usage');
@@ -781,21 +1037,23 @@ function parseArgs(argv) {
   return out;
 }
 
-function buildGeocoder(name, googleKey) {
+function buildGeocoder(name, googleKey, cache) {
   const local = new LocalGazetteer();
+  const wrap = (g) => (cache && cache.enabled) ? new CachedGeocoder(g, cache) : g;
   if (name === 'local') return local;
-  if (name === 'nominatim') return new FallbackGeocoder(new NominatimGeocoder(), local);
+  if (name === 'nominatim') return new FallbackGeocoder(wrap(new NominatimGeocoder()), local);
   if (name === 'google') {
     if (!googleKey) {
       console.error('--geocoder google needs --google-key or $GOOGLE_MAPS_API_KEY; falling back to Nominatim.');
-      return new FallbackGeocoder(new NominatimGeocoder(), local);
+      return new FallbackGeocoder(wrap(new NominatimGeocoder()), local);
     }
-    return new FallbackGeocoder(new GoogleGeocoder(googleKey), new NominatimGeocoder(), local);
+    return new FallbackGeocoder(wrap(new GoogleGeocoder(googleKey)),
+                                 wrap(new NominatimGeocoder()), local);
   }
   throw new Error(`unknown geocoder ${name}`);
 }
 
-function buildRouter(name, googleKey) {
+function buildRouter(name, googleKey, cache) {
   const hav = new HaversineRouter();
   if (name === 'haversine') return hav;
   if (name === 'google') {
@@ -803,13 +1061,15 @@ function buildRouter(name, googleKey) {
       console.error('--router google needs --google-key or $GOOGLE_MAPS_API_KEY; falling back to haversine.');
       return hav;
     }
-    return new GoogleRoutesRouter(googleKey, hav);
+    const g = new GoogleRoutesRouter(googleKey, hav);
+    return (cache && cache.enabled) ? new CachedRouter(g, cache) : g;
   }
   throw new Error(`unknown router ${name}`);
 }
 
 function buildPrices(modes, pricesFile, opts) {
-  const { serpapiKey, amadeusKey, amadeusSecret, amadeusProd, departDate, enableScrapers } = opts;
+  const { serpapiKey, amadeusKey, amadeusSecret, amadeusProd,
+          departDate, enableScrapers, currency = 'GBP', cache = null } = opts;
   const config = new ConfigPrices(modes, pricesFile);
   let scraped = null;
   if (enableScrapers && pricesFile && fs.existsSync(pricesFile)) {
@@ -822,11 +1082,14 @@ function buildPrices(modes, pricesFile, opts) {
     console.error('flight API keys given without --depart-date; skipping live flight prices.');
   } else {
     if (amadeusKey && amadeusSecret && departDate) {
-      flights.push(new AmadeusFlightPrices(amadeusKey, amadeusSecret, departDate, { useProd: !!amadeusProd }));
+      flights.push(new AmadeusFlightPrices(amadeusKey, amadeusSecret, departDate,
+        { useProd: !!amadeusProd, currency, cache }));
     } else if (amadeusKey && !amadeusSecret) {
       console.error('--amadeus-key given without --amadeus-secret; skipping Amadeus.');
     }
-    if (serpapiKey && departDate) flights.push(new SerpApiFlightPrices(serpapiKey, departDate));
+    if (serpapiKey && departDate) {
+      flights.push(new SerpApiFlightPrices(serpapiKey, departDate, { currency, cache }));
+    }
   }
   return new PriceStack(config, { scraped, flights });
 }
@@ -837,8 +1100,10 @@ async function main() {
     console.error(`--optimise must be distance|time|cost, got ${args.optimise}`);
     process.exit(2);
   }
-  const geocoder = buildGeocoder(args.geocoder, args.googleKey);
-  const router = buildRouter(args.router, args.googleKey);
+  const cache = new JsonCache({ filePath: args.cacheFile, ttlSeconds: args.cacheTtl,
+                                 enabled: !args.noCache });
+  const geocoder = buildGeocoder(args.geocoder, args.googleKey, cache);
+  const router = buildRouter(args.router, args.googleKey, cache);
   const prices = buildPrices(DEFAULT_MODES, args.pricesFile, {
     serpapiKey: args.serpapiKey,
     amadeusKey: args.amadeusKey,
@@ -846,6 +1111,8 @@ async function main() {
     amadeusProd: args.amadeusProd,
     departDate: args.departDate,
     enableScrapers: args.enableScrapers,
+    currency: args.currency,
+    cache,
   });
 
   let cities = [];
@@ -892,7 +1159,29 @@ async function main() {
     endCity: args.endCity,
   };
 
-  await report(cities, prices.modes(), router, prices, args.optimise, opts);
+  if (!['include', 'exclude', 'only'].includes(args.nightTrains)) {
+    console.error(`--night-trains must be include|exclude|only, got ${args.nightTrains}`);
+    process.exit(2);
+  }
+  const policy = {
+    ...DEFAULT_TRAIN_POLICY,
+    interrailPass: args.interrail,
+    excludeEurostar: args.excludeEurostar,
+    seatReservationsOk: !args.noReservations,
+    nightTrains: args.nightTrains,
+  };
+  applyPassPricing(prices, policy);
+  const modes = filterTrainModes(prices.modes(), policy);
+
+  const starters = [];
+  for (const name of args.meetFrom) {
+    const c = await resolveCity(name, geocoder);
+    if (!c) { console.error(`could not geocode --meet-from ${name}`); process.exit(2); }
+    starters.push(c);
+  }
+
+  await report(cities, modes, router, prices, args.optimise, opts, policy,
+               { starters: starters.length ? starters : null, currency: args.currency });
 }
 
 if (require.main === module) {
