@@ -233,6 +233,19 @@ class LocalGazetteer:
         "madrid":     (40.4168, -3.7038),
         "dublin":     (53.3498, -6.2603),
         "amsterdam":  (52.3676,  4.9041),
+        "brussels":   (50.8503,  4.3517),
+        "vienna":     (48.2082, 16.3738),
+        "munich":     (48.1351, 11.5820),
+        "zurich":     (47.3769,  8.5417),
+        "milan":      (45.4642,  9.1900),
+        "barcelona":  (41.3851,  2.1734),
+        "prague":     (50.0755, 14.4378),
+        "copenhagen": (55.6761, 12.5683),
+        "stockholm":  (59.3293, 18.0686),
+        "oslo":       (59.9139, 10.7522),
+        "lisbon":     (38.7223, -9.1393),
+        "warsaw":     (52.2297, 21.0122),
+        "budapest":   (47.4979, 19.0402),
         "new york":   (40.7128, -74.0060),
         "tokyo":      (35.6762, 139.6503),
     }
@@ -662,13 +675,27 @@ class PriceStack:
 # ---------------------------------------------------------------------------
 
 
-def leg_cost(mode: Mode, a: City, b: City, router, prices) -> tuple[float, float, float]:
+def leg_cost(mode: Mode, a: City, b: City, router, prices,
+             policy: Optional["TrainPolicy"] = None,
+             reservations: Optional["ReservationLookup"] = None,
+             currency: str = "EUR") -> tuple[float, float, float]:
     distance, time_h = router.route(mode, a, b)
     absolute = prices.leg_price(mode.name, a, b)
     if absolute is not None:
-        cost = absolute
-    else:
-        cost = distance * prices.per_km(mode.name) + prices.per_leg_fixed(mode.name)
+        return distance, time_h, absolute
+    # Default cost: per_km * distance + flat per-leg overhead.
+    cost = distance * prices.per_km(mode.name) + prices.per_leg_fixed(mode.name)
+    # For Train/Night-train under an active pass, replace the flat overhead
+    # with the actual reservation/sleeper fee from the curated dataset.
+    if (policy and policy.interrail_pass and reservations and reservations.loaded()
+            and mode.name in ("Train", "Night train")):
+        cost = distance * prices.per_km(mode.name)  # likely 0 under pass pricing
+        if mode.name == "Train":
+            info = reservations.day_train(a, b, currency=currency)
+            cost += info["fee"]
+        else:  # Night train
+            info = reservations.night_train(a, b, currency=currency, tier="couchette")
+            cost += info["fee"]
     return distance, time_h, cost
 
 
@@ -679,7 +706,7 @@ def leg_cost(mode: Mode, a: City, b: City, router, prices) -> tuple[float, float
 
 @dataclass
 class TrainPolicy:
-    interrail_pass: bool = False
+    interrail_pass: bool = True
     exclude_eurostar: bool = False
     seat_reservations_ok: bool = True
     night_trains: str = "exclude"   # "include" | "exclude" | "only"
@@ -687,6 +714,7 @@ class TrainPolicy:
     sleeper_supplement_gbp: float = 30.0
     reservation_required_min_km: float = 300.0
     night_train_min_km: float = 500.0
+    reservations_file: Optional[str] = None     # path to interrail-reservations.json
 
 
 def crosses_channel(a: City, b: City) -> bool:
@@ -694,6 +722,82 @@ def crosses_channel(a: City, b: City) -> bool:
     def on_isles(c: City) -> bool:
         return 49.5 <= c.lat <= 61.0 and -10.5 <= c.lon <= 2.0
     return on_isles(a) != on_isles(b)
+
+
+class ReservationLookup:
+    """Loads the curated Eurail reservation table and answers per-leg queries.
+
+    For a Train/Night-train leg between two cities the lookup figures out the
+    country of each endpoint, finds the matching domestic/international/night
+    entry, and returns the fee (in EUR) plus metadata (operator, mandatory?,
+    channel_crossing?). Unknown pairs fall back to the JSON's defaults.
+    """
+
+    def __init__(self, path: Optional[str] = None):
+        self.data = {}
+        if path and os.path.exists(path):
+            try:
+                with open(path) as f:
+                    self.data = json.load(f)
+            except Exception as e:
+                print(f"could not load reservations file: {e}", file=sys.stderr)
+        self.city_country = self.data.get("city_country", {})
+        self.domestic = self.data.get("domestic", {})
+        self.international = self.data.get("international", [])
+        self.night_trains = self.data.get("night_trains", [])
+        self.defaults = self.data.get("defaults", {})
+        self.fx = self.data.get("fx", {"EUR": 1.0})
+
+    def loaded(self) -> bool:
+        return bool(self.data)
+
+    def country_of(self, city: City) -> Optional[str]:
+        return self.city_country.get(city.name)
+
+    def _eur_to(self, eur: float, currency: str) -> float:
+        rate = self.fx.get(currency.upper(), self.fx.get("EUR", 1.0))
+        return eur * (rate / self.fx.get("EUR", 1.0))
+
+    def day_train(self, a: City, b: City, currency: str = "EUR") -> dict:
+        """Return {'fee', 'operator', 'mandatory', 'channel_crossing'} for a day train leg."""
+        ca, cb = self.country_of(a), self.country_of(b)
+        if ca is None or cb is None:
+            return {"fee": self._eur_to(self.defaults.get("unknown_day_fee_eur", 5), currency),
+                    "operator": "(unknown)", "mandatory": False, "channel_crossing": False}
+        if ca == cb:
+            dom = self.domestic.get(ca)
+            if dom:
+                return {"fee": self._eur_to(dom.get("fee_eur", 0), currency),
+                        "operator": dom.get("operator", ""),
+                        "mandatory": dom.get("mandatory", False),
+                        "channel_crossing": False}
+            return {"fee": 0, "operator": "", "mandatory": False, "channel_crossing": False}
+        for entry in self.international:
+            pair = entry.get("pair", [])
+            if set(pair) == {ca, cb}:
+                return {"fee": self._eur_to(entry.get("fee_eur", 0), currency),
+                        "operator": entry.get("operator", ""),
+                        "mandatory": entry.get("mandatory", True),
+                        "channel_crossing": bool(entry.get("channel_crossing"))}
+        return {"fee": self._eur_to(self.defaults.get("unknown_day_fee_eur", 5), currency),
+                "operator": "(unknown international)", "mandatory": False,
+                "channel_crossing": crosses_channel(a, b)}
+
+    def night_train(self, a: City, b: City, currency: str = "EUR",
+                    tier: str = "couchette") -> dict:
+        ca, cb = self.country_of(a), self.country_of(b)
+        key = f"{tier}_eur"
+        if ca and cb:
+            for entry in self.night_trains:
+                for pair in entry.get("pairs", []):
+                    if set(pair) == {ca, cb} or (ca == cb and pair == [ca, ca]):
+                        return {"fee": self._eur_to(entry.get(key, 0), currency),
+                                "operator": entry.get("operator", ""),
+                                "mandatory": entry.get("mandatory", True),
+                                "channel_crossing": False}
+        return {"fee": self._eur_to(self.defaults.get("unknown_night_supplement_eur", 30), currency),
+                "operator": "(unknown night train)", "mandatory": False,
+                "channel_crossing": crosses_channel(a, b)}
 
 
 def filter_train_modes(modes: list[Mode], policy: TrainPolicy) -> list[Mode]:
@@ -709,32 +813,48 @@ def filter_train_modes(modes: list[Mode], policy: TrainPolicy) -> list[Mode]:
 
 
 def apply_pass_pricing(prices, policy: TrainPolicy) -> None:
-    """Mutate the ConfigPrices inside a PriceStack so Train/Night train per-km
-    is zero (pass covers it) and the per-leg overhead becomes reservation + sleeper."""
+    """Zero the per-km train fares when an Interrail pass is active. Per-leg
+    reservation / sleeper fees come from ReservationLookup at leg_cost time, so
+    we no longer hard-code them here."""
     if not policy.interrail_pass:
         return
     config = prices.config
     if "Train" in config.by_name:
         config.by_name["Train"].cost_per_km = 0.0
-        config.by_name["Train"].fixed_cost_per_leg = policy.reservation_fee_gbp
+        config.by_name["Train"].fixed_cost_per_leg = 0.0
     if "Night train" in config.by_name:
         config.by_name["Night train"].cost_per_km = 0.0
-        config.by_name["Night train"].fixed_cost_per_leg = (
-            policy.reservation_fee_gbp + policy.sleeper_supplement_gbp
-        )
+        config.by_name["Night train"].fixed_cost_per_leg = 0.0
 
 
-def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy) -> Optional[str]:
+def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy,
+                 reservations: Optional[ReservationLookup] = None) -> Optional[str]:
     """Return None if the leg is allowed, else a short reason string."""
     if mode.name not in ("Train", "Night train"):
         return None
-    if policy.exclude_eurostar and crosses_channel(a, b):
+    # Eurostar opt-out — prefer the JSON's channel_crossing flag when available,
+    # fall back to the lat/lon heuristic for unknown cities.
+    channel = False
+    if reservations and reservations.loaded():
+        info = reservations.day_train(a, b)
+        channel = info.get("channel_crossing", False)
+    else:
+        channel = crosses_channel(a, b)
+    if policy.exclude_eurostar and channel:
         return f"{mode.name}: Eurostar (channel crossing) excluded"
-    distance = haversine_km(a, b) * mode.detour_factor
-    if mode.name == "Train":
-        if not policy.seat_reservations_ok and distance >= policy.reservation_required_min_km:
-            return f"Train: {distance:.0f}km leg needs reservation (--no-reservations set)"
+    if mode.name == "Train" and not policy.seat_reservations_ok:
+        # Prefer JSON's mandatory flag; fall back to distance heuristic.
+        if reservations and reservations.loaded():
+            info = reservations.day_train(a, b)
+            if info.get("mandatory"):
+                return (f"Train: {a.name}->{b.name} on {info.get('operator', '')} "
+                        f"needs reservation (--no-reservations set)")
+        else:
+            distance = haversine_km(a, b) * mode.detour_factor
+            if distance >= policy.reservation_required_min_km:
+                return f"Train: {distance:.0f}km leg likely needs reservation (--no-reservations set)"
     if mode.name == "Night train":
+        distance = haversine_km(a, b) * mode.detour_factor
         if distance < policy.night_train_min_km:
             return f"Night train: {distance:.0f}km leg shorter than {policy.night_train_min_km:.0f}km minimum"
     return None
@@ -774,7 +894,9 @@ def _stay_days(opts: ScheduleOpts, name: str) -> int:
 
 def compute_schedule(tour: list, cities: list, mode: Mode,
                      router, prices, opts: ScheduleOpts,
-                     policy: Optional[TrainPolicy] = None) -> Schedule:
+                     policy: Optional[TrainPolicy] = None,
+                     reservations: Optional[ReservationLookup] = None,
+                     currency: str = "EUR") -> Schedule:
     is_cycle = (opts.end_city is None) or (opts.end_city == opts.start_city) or (opts.end_city == cities[tour[0]].name)
     policy = policy or TrainPolicy()
 
@@ -784,8 +906,10 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
     fail_reason: Optional[str] = None
 
     def check_leg(a: City, b: City) -> Optional[str]:
-        r = leg_feasible(mode, a, b, policy)
-        return r
+        return leg_feasible(mode, a, b, policy, reservations)
+
+    def leg_call(a: City, b: City):
+        return leg_cost(mode, a, b, router, prices, policy, reservations, currency)
 
     for i, idx in enumerate(tour):
         c = cities[idx]
@@ -806,7 +930,7 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
             nxt = cities[tour[i + 1]]
             if fail_reason is None:
                 fail_reason = check_leg(c, nxt)
-            d, t, k = leg_cost(mode, c, nxt, router, prices)
+            d, t, k = leg_call(c, nxt)
             distance += d; travel_h += t; cost += k
             elapsed_h += t
 
@@ -814,7 +938,7 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
         first, last = cities[tour[0]], cities[tour[-1]]
         if fail_reason is None:
             fail_reason = check_leg(last, first)
-        d, t, k = leg_cost(mode, last, first, router, prices)
+        d, t, k = leg_call(last, first)
         distance += d; travel_h += t; cost += k
         elapsed_h += t
 
@@ -850,7 +974,9 @@ def _objective(schedule: Schedule, name: str) -> float:
 
 def constrained_search(cities: list, mode: Mode, router, prices,
                        opts: ScheduleOpts, objective: str,
-                       policy: Optional[TrainPolicy] = None):
+                       policy: Optional[TrainPolicy] = None,
+                       reservations: Optional[ReservationLookup] = None,
+                       currency: str = "EUR"):
     """Return (best_tour, best_schedule) or (None, reason_string)."""
     n = len(cities)
     name_to_idx = {c.name: i for i, c in enumerate(cities)}
@@ -863,7 +989,8 @@ def constrained_search(cities: list, mode: Mode, router, prices,
         return [start_idx] + list(perm) + ([end_idx] if is_open_path else [])
 
     def score(perm):
-        return compute_schedule(assemble(perm), cities, mode, router, prices, opts, policy)
+        return compute_schedule(assemble(perm), cities, mode, router, prices, opts,
+                                policy, reservations, currency)
 
     last_reason = "no feasible tour found"
     best_perm = None
@@ -888,7 +1015,7 @@ def constrained_search(cities: list, mode: Mode, router, prices,
             last = seed_start
             while unv:
                 key = {"distance": 0, "time": 1, "cost": 2}[objective]
-                nxt = min(unv, key=lambda j: leg_cost(mode, cities[last], cities[j], router, prices)[key])
+                nxt = min(unv, key=lambda j: leg_cost(mode, cities[last], cities[j], router, prices, policy, reservations, currency)[key])
                 seq.append(nxt); unv.remove(nxt); last = nxt
             return seq
 
@@ -986,7 +1113,9 @@ def fmt_time(hours: float) -> str:
 
 def find_best_meet(cities: list[City], starters: list[City], mode: Mode,
                    router, prices, opts: ScheduleOpts, objective: str,
-                   policy: Optional[TrainPolicy] = None):
+                   policy: Optional[TrainPolicy] = None,
+                   reservations: Optional[ReservationLookup] = None,
+                   currency: str = "EUR"):
     """Pick the destination that minimises (sum of starters' legs to meet) +
     (joint tour starting at meet). Returns (meet_city, schedule, starter_legs)
     or (None, last_reason, None)."""
@@ -1000,18 +1129,19 @@ def find_best_meet(cities: list[City], starters: list[City], mode: Mode,
         bail = None
         partial_total = 0.0
         for s in starters:
-            fr = leg_feasible(mode, s, meet, policy or TrainPolicy())
+            fr = leg_feasible(mode, s, meet, policy or TrainPolicy(), reservations)
             if fr:
                 bail = fr
                 break
-            d, t, c = leg_cost(mode, s, meet, router, prices)
+            d, t, c = leg_cost(mode, s, meet, router, prices, policy, reservations, currency)
             starter_legs.append({"start": s.name, "distance": d, "time_h": t, "cost": c})
             partial_total += {"distance": d, "time": t, "cost": c}[objective]
         if bail:
             last_reason = bail
             continue
         sub_opts = dataclasses.replace(opts, start_city=meet.name)
-        tour, result = constrained_search(cities, mode, router, prices, sub_opts, objective, policy)
+        tour, result = constrained_search(cities, mode, router, prices, sub_opts, objective,
+                                          policy, reservations, currency)
         if tour is None:
             last_reason = result
             continue
@@ -1037,7 +1167,8 @@ def report(cities: list[City], modes: list[Mode], router, prices,
            optimise_for: str, opts: ScheduleOpts,
            policy: Optional[TrainPolicy] = None,
            starters: Optional[list[City]] = None,
-           currency: str = "GBP") -> None:
+           currency: str = "GBP",
+           reservations: Optional[ReservationLookup] = None) -> None:
     is_open_path = bool(opts.end_city) and opts.end_city != (opts.start_city or cities[0].name)
     sym = currency_symbol(currency)
     print(f"Cities ({len(cities)}): " + ", ".join(c.name for c in cities))
@@ -1068,7 +1199,8 @@ def report(cities: list[City], modes: list[Mode], router, prices,
     for mode in modes:
         if starters:
             meet, sched, starter_legs = find_best_meet(
-                cities, starters, mode, router, prices, opts, optimise_for, policy)
+                cities, starters, mode, router, prices, opts, optimise_for,
+                policy, reservations, currency)
             if meet is None:
                 print(f"{mode.name:<12} {'-':>10} {'-':>10} {'-':>11} {'-':>6}   infeasible: {sched}")
                 continue
@@ -1083,7 +1215,8 @@ def report(cities: list[City], modes: list[Mode], router, prices,
                   f"{sym}{total_cost:>9.2f} {sched.total_days:>5}d   meet at {meet.name} "
                   f"[{starter_str}] then {joint_names}")
             continue
-        tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for, policy)
+        tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for,
+                                          policy, reservations, currency)
         if tour is None:
             print(f"{mode.name:<12} {'-':>10} {'-':>10} {'-':>11} {'-':>6}   infeasible: {result}")
             continue
@@ -1206,9 +1339,13 @@ def main():
 
     rail = p.add_argument_group("rail policy")
     rail.add_argument("--interrail", "--interrail-pass", dest="interrail",
-                      action="store_true",
-                      help="treat Train (and Night train) as covered by an Interrail pass: "
-                           "per-km cost goes to 0, plus a small per-leg reservation fee")
+                      action="store_true", default=True,
+                      help="(default) treat Train + Night train as covered by an Interrail pass; "
+                           "per-km cost is 0 and reservation fees come from interrail-reservations.json")
+    rail.add_argument("--no-pass", dest="interrail", action="store_false",
+                      help="disable Interrail pass pricing; trains use the per-km fare in prices.json")
+    rail.add_argument("--reservations-file", default="interrail-reservations.json",
+                      help="path to the curated Interrail reservations dataset")
     rail.add_argument("--exclude-eurostar", action="store_true",
                       help="exclude Train legs that cross the English Channel")
     rail.add_argument("--no-reservations", action="store_true",
@@ -1321,6 +1458,8 @@ def main():
     apply_pass_pricing(prices, policy)
     modes = filter_train_modes(DEFAULT_MODES, policy)
 
+    reservations = ReservationLookup(args.reservations_file)
+
     starters: list[City] = []
     for name in args.meet_from:
         c = resolve_city(name, geocoder)
@@ -1329,7 +1468,8 @@ def main():
         starters.append(c)
 
     report(cities, modes, router, prices, args.optimise, opts, policy,
-           starters=starters or None, currency=args.currency)
+           starters=starters or None, currency=args.currency,
+           reservations=reservations)
 
 
 if __name__ == "__main__":

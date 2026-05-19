@@ -1,0 +1,122 @@
+{
+  "_comment": "Interrail / Eurail Pass reservation requirements + fees. Source: https://www.eurail.com/en/plan-your-trip/seat-reservations/reservation-fees (as published; figures change occasionally so refresh manually a few times a year). Fees are in EUR. Coverage is good for the major Western/Central European corridors; extend with more (operator, pair) entries as needed.",
+  "version": "2026-05",
+  "source": "https://www.eurail.com/en/plan-your-trip/seat-reservations/reservation-fees",
+  "currency": "EUR",
+  "fx": {
+    "_comment": "Indicative rates for display only; override at runtime if you need precision.",
+    "EUR": 1.0, "GBP": 0.85, "USD": 1.10, "CHF": 0.95, "CAD": 1.50,
+    "AUD": 1.65, "NZD": 1.80, "JPY": 168, "SEK": 11.3, "NOK": 11.5,
+    "DKK": 7.45, "PLN": 4.30, "CZK": 25.0, "HUF": 395
+  },
+  "city_country": {
+    "London": "GB", "Manchester": "GB", "Birmingham": "GB", "Edinburgh": "GB",
+    "Glasgow": "GB", "Cardiff": "GB", "Bristol": "GB", "Belfast": "GB",
+    "Paris": "FR", "Lyon": "FR", "Marseille": "FR", "Bordeaux": "FR",
+    "Lille": "FR", "Nice": "FR", "Strasbourg": "FR", "Toulouse": "FR",
+    "Berlin": "DE", "Munich": "DE", "Hamburg": "DE", "Frankfurt": "DE",
+    "Cologne": "DE", "Stuttgart": "DE", "Hannover": "DE", "Leipzig": "DE",
+    "Madrid": "ES", "Barcelona": "ES", "Seville": "ES", "Valencia": "ES",
+    "Rome": "IT", "Milan": "IT", "Naples": "IT", "Florence": "IT",
+    "Venice": "IT", "Turin": "IT", "Bologna": "IT",
+    "Amsterdam": "NL", "Rotterdam": "NL", "Utrecht": "NL", "The Hague": "NL",
+    "Brussels": "BE", "Antwerp": "BE", "Bruges": "BE",
+    "Vienna": "AT", "Salzburg": "AT", "Innsbruck": "AT", "Graz": "AT",
+    "Zurich": "CH", "Geneva": "CH", "Bern": "CH", "Basel": "CH",
+    "Copenhagen": "DK", "Stockholm": "SE", "Gothenburg": "SE", "Malmo": "SE",
+    "Oslo": "NO", "Bergen": "NO", "Helsinki": "FI",
+    "Dublin": "IE",
+    "Lisbon": "PT", "Porto": "PT",
+    "Prague": "CZ", "Brno": "CZ",
+    "Warsaw": "PL", "Krakow": "PL",
+    "Budapest": "HU"
+  },
+  "domestic": {
+    "_comment": "Reservation requirement for *high-speed* domestic trains. Slower regional trains nearly always don't require reservations across all countries.",
+    "FR": { "fee_eur": 10,  "operator": "TGV INOUI",   "mandatory": true,  "high_speed_only": true },
+    "ES": { "fee_eur": 10,  "operator": "AVE",          "mandatory": true,  "high_speed_only": true },
+    "IT": { "fee_eur": 13,  "operator": "Frecciarossa", "mandatory": true,  "high_speed_only": true },
+    "SE": { "fee_eur": 10,  "operator": "SJ X2000",     "mandatory": false, "high_speed_only": true },
+    "DE": { "fee_eur": 0,   "operator": "ICE",          "mandatory": false },
+    "AT": { "fee_eur": 0,   "operator": "Railjet",      "mandatory": false },
+    "CH": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "NL": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "BE": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "DK": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "NO": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "FI": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "CZ": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "PL": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "HU": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
+    "PT": { "fee_eur": 15,  "operator": "Alfa Pendular","mandatory": true,  "high_speed_only": true },
+    "GB": { "fee_eur": 0,   "operator": "(GB not in Interrail Global Pass)", "mandatory": false }
+  },
+  "international": [
+    { "pair": ["GB","FR"], "operator": "Eurostar",         "fee_eur": 30, "mandatory": true, "channel_crossing": true },
+    { "pair": ["GB","BE"], "operator": "Eurostar",         "fee_eur": 30, "mandatory": true, "channel_crossing": true },
+    { "pair": ["GB","NL"], "operator": "Eurostar",         "fee_eur": 30, "mandatory": true, "channel_crossing": true },
+    { "pair": ["FR","BE"], "operator": "Eurostar/Thalys",  "fee_eur": 22, "mandatory": true },
+    { "pair": ["FR","NL"], "operator": "Eurostar/Thalys",  "fee_eur": 30, "mandatory": true },
+    { "pair": ["FR","DE"], "operator": "TGV INOUI / ICE",  "fee_eur": 19, "mandatory": true },
+    { "pair": ["FR","CH"], "operator": "TGV Lyria",        "fee_eur": 29, "mandatory": true },
+    { "pair": ["FR","IT"], "operator": "TGV / Frecciarossa","fee_eur": 35, "mandatory": true },
+    { "pair": ["FR","ES"], "operator": "TGV inOui / Renfe","fee_eur": 35, "mandatory": true },
+    { "pair": ["FR","LU"], "operator": "TGV",              "fee_eur": 10, "mandatory": true },
+    { "pair": ["DE","BE"], "operator": "ICE",              "fee_eur": 19, "mandatory": true },
+    { "pair": ["DE","NL"], "operator": "ICE / IC",         "fee_eur": 0,  "mandatory": false },
+    { "pair": ["DE","CH"], "operator": "EC / ICE",         "fee_eur": 0,  "mandatory": false },
+    { "pair": ["DE","AT"], "operator": "Railjet / ICE",    "fee_eur": 0,  "mandatory": false },
+    { "pair": ["DE","DK"], "operator": "EC / IC",          "fee_eur": 0,  "mandatory": false },
+    { "pair": ["DE","CZ"], "operator": "EC",               "fee_eur": 0,  "mandatory": false },
+    { "pair": ["DE","PL"], "operator": "EC",               "fee_eur": 0,  "mandatory": false },
+    { "pair": ["AT","IT"], "operator": "Railjet / EC",     "fee_eur": 19, "mandatory": true },
+    { "pair": ["AT","CH"], "operator": "Railjet / EC",     "fee_eur": 0,  "mandatory": false },
+    { "pair": ["AT","HU"], "operator": "Railjet",          "fee_eur": 0,  "mandatory": false },
+    { "pair": ["CH","IT"], "operator": "EC / Frecciarossa","fee_eur": 13, "mandatory": true },
+    { "pair": ["NL","BE"], "operator": "IC / Eurostar",    "fee_eur": 0,  "mandatory": false },
+    { "pair": ["ES","PT"], "operator": "Trenhotel",        "fee_eur": 15, "mandatory": true },
+    { "pair": ["DK","SE"], "operator": "Öresundståg",     "fee_eur": 0,  "mandatory": false },
+    { "pair": ["SE","NO"], "operator": "SJ",               "fee_eur": 0,  "mandatory": false },
+    { "pair": ["NO","SE"], "operator": "SJ",               "fee_eur": 0,  "mandatory": false }
+  ],
+  "night_trains": [
+    {
+      "operator": "ÖBB Nightjet",
+      "pairs": [
+        ["AT","DE"], ["AT","IT"], ["AT","CH"], ["AT","BE"], ["AT","NL"],
+        ["DE","IT"], ["DE","CH"], ["DE","FR"], ["DE","NL"], ["DE","BE"],
+        ["AT","HU"], ["IT","CH"]
+      ],
+      "seat_eur": 19, "couchette_eur": 39, "sleeper_eur": 89,
+      "mandatory": true
+    },
+    {
+      "operator": "European Sleeper",
+      "pairs": [["BE","DE"], ["DE","CZ"], ["BE","CZ"], ["NL","DE"], ["NL","CZ"]],
+      "seat_eur": 0, "couchette_eur": 49, "sleeper_eur": 99,
+      "mandatory": true
+    },
+    {
+      "operator": "Trenitalia Intercity Notte",
+      "pairs": [["IT","IT"]],
+      "seat_eur": 0, "couchette_eur": 30, "sleeper_eur": 80,
+      "mandatory": true
+    },
+    {
+      "operator": "Snälltåget",
+      "pairs": [["SE","DE"]],
+      "seat_eur": 0, "couchette_eur": 49, "sleeper_eur": 79,
+      "mandatory": true
+    },
+    {
+      "operator": "Renfe Trenhotel",
+      "pairs": [["ES","PT"], ["ES","FR"]],
+      "seat_eur": 0, "couchette_eur": 30, "sleeper_eur": 70,
+      "mandatory": true
+    }
+  ],
+  "defaults": {
+    "unknown_day_fee_eur": 5,
+    "unknown_night_supplement_eur": 30
+  }
+}

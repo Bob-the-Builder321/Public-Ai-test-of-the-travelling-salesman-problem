@@ -72,7 +72,7 @@ class LocalStorageCache {
 }
 
 const DEFAULT_TRAIN_POLICY = {
-  interrailPass: false,
+  interrailPass: true,
   excludeEurostar: false,
   seatReservationsOk: true,
   nightTrains: 'exclude',
@@ -81,6 +81,155 @@ const DEFAULT_TRAIN_POLICY = {
   reservationRequiredMinKm: 300,
   nightTrainMinKm: 500,
 };
+
+// Curated Interrail reservation data, mirrors interrail-reservations.json.
+// Source: https://www.eurail.com/en/plan-your-trip/seat-reservations/reservation-fees
+const INTERRAIL_DATA = {
+  fx: { EUR: 1.0, GBP: 0.85, USD: 1.10, CHF: 0.95, CAD: 1.50, AUD: 1.65, NZD: 1.80,
+        JPY: 168, SEK: 11.3, NOK: 11.5, DKK: 7.45, PLN: 4.30, CZK: 25.0, HUF: 395 },
+  city_country: {
+    London: 'GB', Manchester: 'GB', Birmingham: 'GB', Edinburgh: 'GB',
+    Glasgow: 'GB', Cardiff: 'GB', Bristol: 'GB', Belfast: 'GB',
+    Paris: 'FR', Lyon: 'FR', Marseille: 'FR', Bordeaux: 'FR',
+    Lille: 'FR', Nice: 'FR', Strasbourg: 'FR', Toulouse: 'FR',
+    Berlin: 'DE', Munich: 'DE', Hamburg: 'DE', Frankfurt: 'DE',
+    Cologne: 'DE', Stuttgart: 'DE', Hannover: 'DE', Leipzig: 'DE',
+    Madrid: 'ES', Barcelona: 'ES', Seville: 'ES', Valencia: 'ES',
+    Rome: 'IT', Milan: 'IT', Naples: 'IT', Florence: 'IT',
+    Venice: 'IT', Turin: 'IT', Bologna: 'IT',
+    Amsterdam: 'NL', Rotterdam: 'NL', Utrecht: 'NL', 'The Hague': 'NL',
+    Brussels: 'BE', Antwerp: 'BE', Bruges: 'BE',
+    Vienna: 'AT', Salzburg: 'AT', Innsbruck: 'AT', Graz: 'AT',
+    Zurich: 'CH', Geneva: 'CH', Bern: 'CH', Basel: 'CH',
+    Copenhagen: 'DK', Stockholm: 'SE', Gothenburg: 'SE', Malmo: 'SE',
+    Oslo: 'NO', Bergen: 'NO', Helsinki: 'FI',
+    Dublin: 'IE', Lisbon: 'PT', Porto: 'PT',
+    Prague: 'CZ', Brno: 'CZ', Warsaw: 'PL', Krakow: 'PL', Budapest: 'HU',
+  },
+  domestic: {
+    FR: { fee_eur: 10, operator: 'TGV INOUI',    mandatory: true,  high_speed_only: true },
+    ES: { fee_eur: 10, operator: 'AVE',          mandatory: true,  high_speed_only: true },
+    IT: { fee_eur: 13, operator: 'Frecciarossa', mandatory: true,  high_speed_only: true },
+    SE: { fee_eur: 10, operator: 'SJ X2000',     mandatory: false, high_speed_only: true },
+    DE: { fee_eur: 0,  operator: 'ICE',          mandatory: false },
+    AT: { fee_eur: 0,  operator: 'Railjet',      mandatory: false },
+    CH: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    NL: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    BE: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    DK: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    NO: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    FI: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    CZ: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    PL: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    HU: { fee_eur: 0,  operator: 'various',      mandatory: false },
+    PT: { fee_eur: 15, operator: 'Alfa Pendular',mandatory: true,  high_speed_only: true },
+    GB: { fee_eur: 0,  operator: '(GB not in Interrail Global Pass)', mandatory: false },
+  },
+  international: [
+    { pair: ['GB','FR'], operator: 'Eurostar',          fee_eur: 30, mandatory: true, channel_crossing: true },
+    { pair: ['GB','BE'], operator: 'Eurostar',          fee_eur: 30, mandatory: true, channel_crossing: true },
+    { pair: ['GB','NL'], operator: 'Eurostar',          fee_eur: 30, mandatory: true, channel_crossing: true },
+    { pair: ['FR','BE'], operator: 'Eurostar/Thalys',   fee_eur: 22, mandatory: true },
+    { pair: ['FR','NL'], operator: 'Eurostar/Thalys',   fee_eur: 30, mandatory: true },
+    { pair: ['FR','DE'], operator: 'TGV INOUI / ICE',   fee_eur: 19, mandatory: true },
+    { pair: ['FR','CH'], operator: 'TGV Lyria',         fee_eur: 29, mandatory: true },
+    { pair: ['FR','IT'], operator: 'TGV / Frecciarossa',fee_eur: 35, mandatory: true },
+    { pair: ['FR','ES'], operator: 'TGV inOui / Renfe', fee_eur: 35, mandatory: true },
+    { pair: ['FR','LU'], operator: 'TGV',               fee_eur: 10, mandatory: true },
+    { pair: ['DE','BE'], operator: 'ICE',               fee_eur: 19, mandatory: true },
+    { pair: ['DE','NL'], operator: 'ICE / IC',          fee_eur: 0,  mandatory: false },
+    { pair: ['DE','CH'], operator: 'EC / ICE',          fee_eur: 0,  mandatory: false },
+    { pair: ['DE','AT'], operator: 'Railjet / ICE',     fee_eur: 0,  mandatory: false },
+    { pair: ['DE','DK'], operator: 'EC / IC',           fee_eur: 0,  mandatory: false },
+    { pair: ['DE','CZ'], operator: 'EC',                fee_eur: 0,  mandatory: false },
+    { pair: ['DE','PL'], operator: 'EC',                fee_eur: 0,  mandatory: false },
+    { pair: ['AT','IT'], operator: 'Railjet / EC',      fee_eur: 19, mandatory: true },
+    { pair: ['AT','CH'], operator: 'Railjet / EC',      fee_eur: 0,  mandatory: false },
+    { pair: ['AT','HU'], operator: 'Railjet',           fee_eur: 0,  mandatory: false },
+    { pair: ['CH','IT'], operator: 'EC / Frecciarossa', fee_eur: 13, mandatory: true },
+    { pair: ['NL','BE'], operator: 'IC / Eurostar',     fee_eur: 0,  mandatory: false },
+    { pair: ['ES','PT'], operator: 'Trenhotel',         fee_eur: 15, mandatory: true },
+    { pair: ['DK','SE'], operator: 'Öresundståg',      fee_eur: 0,  mandatory: false },
+    { pair: ['SE','NO'], operator: 'SJ',                fee_eur: 0,  mandatory: false },
+    { pair: ['NO','SE'], operator: 'SJ',                fee_eur: 0,  mandatory: false },
+  ],
+  night_trains: [
+    { operator: 'ÖBB Nightjet',
+      pairs: [['AT','DE'], ['AT','IT'], ['AT','CH'], ['AT','BE'], ['AT','NL'],
+              ['DE','IT'], ['DE','CH'], ['DE','FR'], ['DE','NL'], ['DE','BE'],
+              ['AT','HU'], ['IT','CH']],
+      seat_eur: 19, couchette_eur: 39, sleeper_eur: 89, mandatory: true },
+    { operator: 'European Sleeper',
+      pairs: [['BE','DE'], ['DE','CZ'], ['BE','CZ'], ['NL','DE'], ['NL','CZ']],
+      seat_eur: 0, couchette_eur: 49, sleeper_eur: 99, mandatory: true },
+    { operator: 'Trenitalia Intercity Notte',
+      pairs: [['IT','IT']],
+      seat_eur: 0, couchette_eur: 30, sleeper_eur: 80, mandatory: true },
+    { operator: 'Snälltåget', pairs: [['SE','DE']],
+      seat_eur: 0, couchette_eur: 49, sleeper_eur: 79, mandatory: true },
+    { operator: 'Renfe Trenhotel', pairs: [['ES','PT'], ['ES','FR']],
+      seat_eur: 0, couchette_eur: 30, sleeper_eur: 70, mandatory: true },
+  ],
+  defaults: { unknown_day_fee_eur: 5, unknown_night_supplement_eur: 30 },
+};
+
+class ReservationLookup {
+  constructor(data = INTERRAIL_DATA) {
+    this.data = data || {};
+    this.cityCountry = this.data.city_country || {};
+    this.domestic = this.data.domestic || {};
+    this.international = this.data.international || [];
+    this.nightTrains = this.data.night_trains || [];
+    this.defaults = this.data.defaults || {};
+    this.fx = this.data.fx || { EUR: 1 };
+  }
+  loaded() { return !!this.data && !!this.data.city_country; }
+  countryOf(city) { return this.cityCountry[city.name] || null; }
+  _eurTo(eur, currency) {
+    const rate = this.fx[currency.toUpperCase()] || this.fx.EUR || 1;
+    return eur * (rate / (this.fx.EUR || 1));
+  }
+  dayTrain(a, b, currency = 'EUR') {
+    const ca = this.countryOf(a), cb = this.countryOf(b);
+    if (!ca || !cb) return { fee: this._eurTo(this.defaults.unknown_day_fee_eur || 5, currency),
+                              operator: '(unknown)', mandatory: false, channelCrossing: false };
+    if (ca === cb) {
+      const dom = this.domestic[ca];
+      return dom
+        ? { fee: this._eurTo(dom.fee_eur || 0, currency), operator: dom.operator || '',
+            mandatory: !!dom.mandatory, channelCrossing: false }
+        : { fee: 0, operator: '', mandatory: false, channelCrossing: false };
+    }
+    for (const e of this.international) {
+      const p = e.pair || [];
+      if (p.length === 2 && ((p[0] === ca && p[1] === cb) || (p[0] === cb && p[1] === ca))) {
+        return { fee: this._eurTo(e.fee_eur || 0, currency),
+                 operator: e.operator || '', mandatory: e.mandatory !== false,
+                 channelCrossing: !!e.channel_crossing };
+      }
+    }
+    return { fee: this._eurTo(this.defaults.unknown_day_fee_eur || 5, currency),
+             operator: '(unknown international)', mandatory: false,
+             channelCrossing: crossesChannel(a, b) };
+  }
+  nightTrain(a, b, currency = 'EUR', tier = 'couchette') {
+    const ca = this.countryOf(a), cb = this.countryOf(b);
+    const key = `${tier}_eur`;
+    if (ca && cb) {
+      for (const e of this.nightTrains) {
+        for (const p of (e.pairs || [])) {
+          if ((p[0] === ca && p[1] === cb) || (p[0] === cb && p[1] === ca)) {
+            return { fee: this._eurTo(e[key] || 0, currency), operator: e.operator || '',
+                     mandatory: e.mandatory !== false, channelCrossing: false };
+          }
+        }
+      }
+    }
+    return { fee: this._eurTo(this.defaults.unknown_night_supplement_eur || 30, currency),
+             operator: '(unknown night train)', mandatory: false,
+             channelCrossing: crossesChannel(a, b) };
+  }
+}
 
 function crossesChannel(a, b) {
   const onIsles = (c) => c.lat >= 49.5 && c.lat <= 61.0 && c.lon >= -10.5 && c.lon <= 2.0;
@@ -98,28 +247,40 @@ function filterTrainModes(modes, policy) {
 function applyPassPricing(prices, policy) {
   if (!policy.interrailPass) return;
   const cfg = prices.config.byName;
-  if (cfg.Train) {
-    cfg.Train.costPerKm = 0;
-    cfg.Train.fixedCostPerLeg = policy.reservationFeeGbp;
-  }
+  if (cfg.Train) { cfg.Train.costPerKm = 0; cfg.Train.fixedCostPerLeg = 0; }
   if (cfg['Night train']) {
     cfg['Night train'].costPerKm = 0;
-    cfg['Night train'].fixedCostPerLeg = policy.reservationFeeGbp + policy.sleeperSupplementGbp;
+    cfg['Night train'].fixedCostPerLeg = 0;
   }
 }
 
-function legFeasible(mode, a, b, policy) {
+function legFeasible(mode, a, b, policy, reservations = null) {
   if (mode.name !== 'Train' && mode.name !== 'Night train') return null;
-  if (policy.excludeEurostar && crossesChannel(a, b)) {
+  let channel = false;
+  if (reservations && reservations.loaded()) {
+    channel = reservations.dayTrain(a, b).channelCrossing;
+  } else {
+    channel = crossesChannel(a, b);
+  }
+  if (policy.excludeEurostar && channel) {
     return `${mode.name}: Eurostar (channel crossing) excluded`;
   }
-  const distance = haversineKm(a, b) * mode.detourFactor;
-  if (mode.name === 'Train' && !policy.seatReservationsOk
-      && distance >= policy.reservationRequiredMinKm) {
-    return `Train: ${distance.toFixed(0)}km leg needs reservation`;
+  if (mode.name === 'Train' && !policy.seatReservationsOk) {
+    if (reservations && reservations.loaded()) {
+      const info = reservations.dayTrain(a, b);
+      if (info.mandatory) return `Train: ${a.name}->${b.name} on ${info.operator} needs reservation`;
+    } else {
+      const distance = haversineKm(a, b) * mode.detourFactor;
+      if (distance >= policy.reservationRequiredMinKm) {
+        return `Train: ${distance.toFixed(0)}km leg likely needs reservation`;
+      }
+    }
   }
-  if (mode.name === 'Night train' && distance < policy.nightTrainMinKm) {
-    return `Night train: ${distance.toFixed(0)}km leg shorter than ${policy.nightTrainMinKm}km minimum`;
+  if (mode.name === 'Night train') {
+    const distance = haversineKm(a, b) * mode.detourFactor;
+    if (distance < policy.nightTrainMinKm) {
+      return `Night train: ${distance.toFixed(0)}km leg shorter than ${policy.nightTrainMinKm}km minimum`;
+    }
   }
   return null;
 }
@@ -469,12 +630,20 @@ class PriceStack {
 // Leg cost + TSP
 // ---------------------------------------------------------------------------
 
-async function legCost(mode, a, b, router, prices) {
+async function legCost(mode, a, b, router, prices,
+                       { policy = null, reservations = null, currency = 'EUR' } = {}) {
   const { distance, timeH } = await router.route(mode, a, b);
   const absolute = await prices.legPrice(mode.name, a, b);
-  const cost = absolute != null
-    ? absolute
-    : distance * (await prices.perKm(mode.name)) + prices.perLegFixed(mode.name);
+  if (absolute != null) return { distance, timeH, cost: absolute };
+  let cost = distance * (await prices.perKm(mode.name)) + prices.perLegFixed(mode.name);
+  if (policy && policy.interrailPass && reservations && reservations.loaded()
+      && (mode.name === 'Train' || mode.name === 'Night train')) {
+    cost = distance * (await prices.perKm(mode.name));
+    const info = mode.name === 'Train'
+      ? reservations.dayTrain(a, b, currency)
+      : reservations.nightTrain(a, b, currency, 'couchette');
+    cost += info.fee;
+  }
   return { distance, timeH, cost };
 }
 
@@ -509,8 +678,10 @@ function stayDaysFor(opts, name) {
   return opts.stays && opts.stays[name] != null ? Number(opts.stays[name]) : opts.daysPerCity;
 }
 
-async function computeSchedule(tour, cities, mode, router, prices, opts, policy) {
+async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
+                               reservations = null, currency = 'EUR') {
   policy = policy || DEFAULT_TRAIN_POLICY;
+  const legOpts = { policy, reservations, currency };
   const startName = opts.startCity || cities[tour[0]].name;
   const isOpenPath = !!opts.endCity && opts.endCity !== startName;
   let distance = 0, travelH = 0, cost = 0, elapsedH = 0;
@@ -531,16 +702,16 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy)
     elapsedH = departH;
     if (i + 1 < tour.length) {
       const nxt = cities[tour[i + 1]];
-      if (failReason === null) failReason = legFeasible(mode, c, nxt, policy);
-      const leg = await legCost(mode, c, nxt, router, prices);
+      if (failReason === null) failReason = legFeasible(mode, c, nxt, policy, reservations);
+      const leg = await legCost(mode, c, nxt, router, prices, legOpts);
       distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
       elapsedH += leg.timeH;
     }
   }
   if (!isOpenPath && tour.length > 1) {
     const first = cities[tour[0]], last = cities[tour[tour.length - 1]];
-    if (failReason === null) failReason = legFeasible(mode, last, first, policy);
-    const leg = await legCost(mode, last, first, router, prices);
+    if (failReason === null) failReason = legFeasible(mode, last, first, policy, reservations);
+    const leg = await legCost(mode, last, first, router, prices, legOpts);
     distance += leg.distance; travelH += leg.timeH; cost += leg.cost;
     elapsedH += leg.timeH;
   }
@@ -567,7 +738,8 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy)
 
 function pickObjective(s, m) { return m === 'distance' ? s.distance : m === 'time' ? s.travelH : s.cost; }
 
-async function constrainedSearch(cities, mode, router, prices, opts, objective, policy) {
+async function constrainedSearch(cities, mode, router, prices, opts, objective, policy,
+                                  reservations = null, currency = 'EUR') {
   const n = cities.length;
   const idxOf = new Map(cities.map((c, i) => [c.name, i]));
   const startIdx = idxOf.get(opts.startCity) ?? 0;
@@ -589,7 +761,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective, 
 
   if (factorial(middle.length) <= 40320) {
     for (const perm of permutations(middle)) {
-      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts, policy);
+      const sched = await computeSchedule(assemble(perm), cities, mode, router, prices, opts, policy, reservations, currency);
       consider(perm, sched);
     }
   } else {
@@ -597,7 +769,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective, 
     for (let s = 1; s <= 6; s++) seeds.push(shuffle(middle.slice(), s));
     for (const seed of seeds) {
       let cur = seed.slice();
-      let curS = await computeSchedule(assemble(cur), cities, mode, router, prices, opts, policy);
+      let curS = await computeSchedule(assemble(cur), cities, mode, router, prices, opts, policy, reservations, currency);
       let curV = curS.feasible ? pickObjective(curS, objective) : Infinity;
       let improved = true;
       while (improved) {
@@ -605,7 +777,7 @@ async function constrainedSearch(cities, mode, router, prices, opts, objective, 
         for (let i = 0; i < cur.length - 1; i++) {
           for (let j = i + 1; j < cur.length; j++) {
             const cand = cur.slice(0, i).concat(cur.slice(i, j + 1).reverse(), cur.slice(j + 1));
-            const cs = await computeSchedule(assemble(cand), cities, mode, router, prices, opts, policy);
+            const cs = await computeSchedule(assemble(cand), cities, mode, router, prices, opts, policy, reservations, currency);
             if (!cs.feasible) continue;
             const v = pickObjective(cs, objective);
             if (v + 1e-9 < curV) { cur = cand; curS = cs; curV = v; improved = true; }
@@ -901,7 +1073,8 @@ function collectRailPolicy() {
   };
 }
 
-async function findBestMeet(cities, starters, mode, router, prices, opts, objective, policy) {
+async function findBestMeet(cities, starters, mode, router, prices, opts, objective, policy,
+                            reservations = null, currency = 'EUR') {
   let best = null;
   let bestTotal = Infinity;
   let lastReason = 'no feasible meet point + tour';
@@ -910,15 +1083,17 @@ async function findBestMeet(cities, starters, mode, router, prices, opts, object
     const starterLegs = [];
     let partial = 0;
     for (const s of starters) {
-      const fr = legFeasible(mode, s, meet, policy || DEFAULT_TRAIN_POLICY);
+      const fr = legFeasible(mode, s, meet, policy || DEFAULT_TRAIN_POLICY, reservations);
       if (fr) { bail = fr; break; }
-      const { distance, timeH, cost } = await legCost(mode, s, meet, router, prices);
+      const { distance, timeH, cost } = await legCost(mode, s, meet, router, prices,
+                                                       { policy, reservations, currency });
       starterLegs.push({ start: s.name, distance, timeH, cost });
       partial += objective === 'distance' ? distance : objective === 'time' ? timeH : cost;
     }
     if (bail) { lastReason = bail; continue; }
     const subOpts = { ...opts, startCity: meet.name };
-    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, subOpts, objective, policy);
+    const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices,
+      subOpts, objective, policy, reservations, currency);
     if (!tour) { lastReason = reason; continue; }
     const total = partial + pickObjective(sched, objective);
     if (total < bestTotal) { bestTotal = total; best = { meet, sched, starterLegs }; }
@@ -936,6 +1111,7 @@ async function run() {
   applyPassPricing(prices, policy);
   const modes = filterTrainModes(prices.modes(), policy);
   const currency = $('currency').value || 'GBP';
+  const reservations = new ReservationLookup();
 
   if (Object.keys(opts.pins).length && !opts.startDate) {
     setStatus('Pinned dates require a trip Start date.', 'error');
@@ -954,7 +1130,8 @@ async function run() {
     const isOpenPath = !!opts.endCity && opts.endCity !== opts.startCity;
     for (const mode of modes) {
       if (state.starters.length) {
-        const r = await findBestMeet(cities, state.starters, mode, router, prices, opts, optimise, policy);
+        const r = await findBestMeet(cities, state.starters, mode, router, prices, opts, optimise,
+          policy, reservations, currency);
         if (!r.meet) { rows.push({ mode: mode.name, infeasible: r.reason }); continue; }
         const totalStarter = r.starterLegs.reduce((s, l) => s + l.cost, 0);
         rows.push({
@@ -966,7 +1143,8 @@ async function run() {
         });
         continue;
       }
-      const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices, opts, optimise, policy);
+      const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices,
+        opts, optimise, policy, reservations, currency);
       if (!tour) { rows.push({ mode: mode.name, infeasible: reason }); continue; }
       rows.push({
         mode: mode.name,
