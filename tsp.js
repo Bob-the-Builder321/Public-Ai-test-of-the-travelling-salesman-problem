@@ -605,6 +605,28 @@ class ReservationLookup {
     this.nightTrains = this.data.night_trains || [];
     this.defaults = this.data.defaults || {};
     this.fx = this.data.fx || { EUR: 1 };
+    this.passPrices = this.data.pass_prices || {};
+  }
+
+  pickPass(railDays, tripDays, currency = 'EUR', tier = 'global_pass_adult_first') {
+    const prices = this.passPrices[tier] || {};
+    let best = null;
+    const consider = (price, eur, kind, label) => {
+      if (!best || price < best.price) best = { price, priceEur: eur, kind, label };
+    };
+    for (const f of prices.flexi || []) {
+      if (railDays <= f.travel_days && tripDays <= f.within_days) {
+        consider(this._eurTo(f.price_eur, currency), f.price_eur, 'flexi',
+                 `${f.travel_days}d flexi / ${f.within_days}d window`);
+      }
+    }
+    for (const c of prices.continuous || []) {
+      if (tripDays <= c.duration_days) {
+        consider(this._eurTo(c.price_eur, currency), c.price_eur, 'continuous',
+                 `${c.duration_days}d continuous`);
+      }
+    }
+    return best;
   }
   loaded() { return Object.keys(this.data).length > 0; }
   countryOf(city) { return this.cityCountry[city.name] || null; }
@@ -791,6 +813,22 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
 
   const totalDays = Math.max(1, Math.ceil(elapsedH / 24));
 
+  // Interrail pass cost
+  let passCost = 0;
+  let passLabel = null;
+  if (policy && policy.interrailPass && reservations && reservations.loaded()
+      && (mode.name === 'Train' || mode.name === 'Night train')) {
+    const isCycle = !((opts.endCity || '') && opts.endCity !== (opts.startCity || cities[tour[0]].name));
+    const railDays = isCycle ? tour.length : Math.max(1, tour.length - 1);
+    const pick = reservations.pickPass(railDays, totalDays, currency);
+    if (pick) {
+      passCost = pick.price;
+      passLabel = `${pick.label} (${pick.priceEur.toFixed(0)}€)`;
+    } else {
+      passLabel = `no Global Pass covers ${railDays}d rail / ${totalDays}d trip`;
+    }
+  }
+
   let reason = failReason;
   if (reason === null && opts.maxDays != null && totalDays > opts.maxDays) {
     reason = `trip is ${totalDays}d, exceeds max ${opts.maxDays}d`;
@@ -811,7 +849,8 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
 
   return {
     feasible: reason === null,
-    distance, travelH, cost, totalDays, stops, reason,
+    distance, travelH, cost: cost + passCost, totalDays, stops, reason,
+    passCost, passLabel,
   };
 }
 
@@ -1057,7 +1096,8 @@ async function report(cities, modes, router, prices, optimiseFor, opts, policy,
       const time = fmtTime(sched.travelH).padStart(10);
       const cost = `${sym}${totalCost.toFixed(2)}`.padStart(11);
       const days = `${sched.totalDays}d`.padStart(6);
-      console.log(`${mode.name.padEnd(12)} ${dist} ${time} ${cost} ${days}   meet at ${meet.name} [${starterStr}] then ${joint}`);
+      const prefix = sched.passLabel ? `[pass: ${sched.passLabel}] ` : '';
+      console.log(`${mode.name.padEnd(12)} ${dist} ${time} ${cost} ${days}   ${prefix}meet at ${meet.name} [${starterStr}] then ${joint}`);
       continue;
     }
     const { tour, sched, reason } = await constrainedSearch(cities, mode, router, prices,
@@ -1068,6 +1108,7 @@ async function report(cities, modes, router, prices, optimiseFor, opts, policy,
     }
     let names = sched.stops.map(fmtStop).join(' -> ');
     if (!isOpenPath) names += ` -> ${sched.stops[0].name}`;
+    if (sched.passLabel) names = `[pass: ${sched.passLabel}] ${names}`;
     const dist = `${sched.distance.toFixed(0)}km`.padStart(10);
     const time = fmtTime(sched.travelH).padStart(10);
     const cost = `${sym}${sched.cost.toFixed(2)}`.padStart(11);

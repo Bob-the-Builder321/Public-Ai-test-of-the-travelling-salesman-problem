@@ -49,7 +49,7 @@
     "PL": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
     "HU": { "fee_eur": 0,   "operator": "various",      "mandatory": false },
     "PT": { "fee_eur": 15,  "operator": "Alfa Pendular","mandatory": true,  "high_speed_only": true },
-    "GB": { "fee_eur": 0,   "operator": "(GB not in Interrail Global Pass)", "mandatory": false }
+    "GB": { "fee_eur": 0,   "operator": "GB national rail (covered by Global Pass)", "mandatory": false }
   },
   "international": [
     { "pair": ["GB","FR"], "operator": "Eurostar",         "fee_eur": 30, "mandatory": true, "channel_crossing": true },
@@ -118,5 +118,24 @@
   "defaults": {
     "unknown_day_fee_eur": 5,
     "unknown_night_supplement_eur": 30
+  },
+  "pass_prices": {
+    "_comment": "Interrail Global Pass adult 1st class (EUR). Source: interrail.eu (May 2026). Extend with 2nd-class / youth / senior tiers as needed. Flexi passes = N travel days within a window; Continuous passes = consecutive calendar days.",
+    "global_pass_adult_first": {
+      "flexi": [
+        { "travel_days": 4,  "within_days": 30, "price_eur": 367 },
+        { "travel_days": 5,  "within_days": 30, "price_eur": 413 },
+        { "travel_days": 7,  "within_days": 30, "price_eur": 495 },
+        { "travel_days": 10, "within_days": 60, "price_eur": 581 },
+        { "travel_days": 15, "within_days": 60, "price_eur": 718 }
+      ],
+      "continuous": [
+        { "duration_days": 15, "price_eur": 618  },
+        { "duration_days": 22, "price_eur": 761  },
+        { "duration_days": 31, "price_eur": 904  },
+        { "duration_days": 62, "price_eur": 1073 },
+        { "duration_days": 93, "price_eur": 1242 }
+      ]
+    }
   }
 }

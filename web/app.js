@@ -171,6 +171,24 @@ const INTERRAIL_DATA = {
       seat_eur: 0, couchette_eur: 30, sleeper_eur: 70, mandatory: true },
   ],
   defaults: { unknown_day_fee_eur: 5, unknown_night_supplement_eur: 30 },
+  pass_prices: {
+    global_pass_adult_first: {
+      flexi: [
+        { travel_days: 4,  within_days: 30, price_eur: 367 },
+        { travel_days: 5,  within_days: 30, price_eur: 413 },
+        { travel_days: 7,  within_days: 30, price_eur: 495 },
+        { travel_days: 10, within_days: 60, price_eur: 581 },
+        { travel_days: 15, within_days: 60, price_eur: 718 },
+      ],
+      continuous: [
+        { duration_days: 15, price_eur: 618  },
+        { duration_days: 22, price_eur: 761  },
+        { duration_days: 31, price_eur: 904  },
+        { duration_days: 62, price_eur: 1073 },
+        { duration_days: 93, price_eur: 1242 },
+      ],
+    },
+  },
 };
 
 class ReservationLookup {
@@ -182,6 +200,28 @@ class ReservationLookup {
     this.nightTrains = this.data.night_trains || [];
     this.defaults = this.data.defaults || {};
     this.fx = this.data.fx || { EUR: 1 };
+    this.passPrices = this.data.pass_prices || {};
+  }
+
+  pickPass(railDays, tripDays, currency = 'EUR', tier = 'global_pass_adult_first') {
+    const prices = this.passPrices[tier] || {};
+    let best = null;
+    const consider = (price, eur, kind, label) => {
+      if (!best || price < best.price) best = { price, priceEur: eur, kind, label };
+    };
+    for (const f of prices.flexi || []) {
+      if (railDays <= f.travel_days && tripDays <= f.within_days) {
+        consider(this._eurTo(f.price_eur, currency), f.price_eur, 'flexi',
+                 `${f.travel_days}d flexi / ${f.within_days}d window`);
+      }
+    }
+    for (const c of prices.continuous || []) {
+      if (tripDays <= c.duration_days) {
+        consider(this._eurTo(c.price_eur, currency), c.price_eur, 'continuous',
+                 `${c.duration_days}d continuous`);
+      }
+    }
+    return best;
   }
   loaded() { return !!this.data && !!this.data.city_country; }
   countryOf(city) { return this.cityCountry[city.name] || null; }
@@ -716,6 +756,21 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
     elapsedH += leg.timeH;
   }
   const totalDays = Math.max(1, Math.ceil(elapsedH / 24));
+  let passCost = 0;
+  let passLabel = null;
+  if (policy && policy.interrailPass && reservations && reservations.loaded()
+      && (mode.name === 'Train' || mode.name === 'Night train')) {
+    const startName2 = opts.startCity || cities[tour[0]].name;
+    const isCycle2 = !(opts.endCity && opts.endCity !== startName2);
+    const railDays = isCycle2 ? tour.length : Math.max(1, tour.length - 1);
+    const pick = reservations.pickPass(railDays, totalDays, currency);
+    if (pick) {
+      passCost = pick.price;
+      passLabel = `${pick.label} (${pick.priceEur.toFixed(0)}€)`;
+    } else {
+      passLabel = `no Global Pass covers ${railDays}d rail / ${totalDays}d trip`;
+    }
+  }
   let reason = failReason;
   if (reason === null && opts.maxDays != null && totalDays > opts.maxDays) {
     reason = `trip is ${totalDays}d, exceeds max ${opts.maxDays}d`;
@@ -733,7 +788,8 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
       }
     }
   }
-  return { feasible: reason === null, distance, travelH, cost, totalDays, stops, reason };
+  return { feasible: reason === null, distance, travelH, cost: cost + passCost,
+           totalDays, stops, reason, passCost, passLabel };
 }
 
 function pickObjective(s, m) { return m === 'distance' ? s.distance : m === 'time' ? s.travelH : s.cost; }
@@ -1140,6 +1196,7 @@ async function run() {
           cost: r.sched.cost + totalStarter, days: r.sched.totalDays,
           stops: r.sched.stops, isOpenPath,
           meet: r.meet.name, starterLegs: r.starterLegs,
+          passLabel: r.sched.passLabel,
         });
         continue;
       }
@@ -1151,6 +1208,7 @@ async function run() {
         distance: sched.distance, timeH: sched.travelH,
         cost: sched.cost, days: sched.totalDays,
         stops: sched.stops, isOpenPath,
+        passLabel: sched.passLabel,
       });
     }
     renderResults(rows, optimise, opts, policy, currency);
@@ -1214,6 +1272,7 @@ function renderResults(rows, optimise, opts, policy, currency = 'GBP') {
         `${l.start}→${r.meet} ${l.distance.toFixed(0)}km/${fmtTime(l.timeH).trim()}`).join(', ');
       itinerary = `meet at ${r.meet} [${starterStr}] then ${itinerary}`;
     }
+    if (r.passLabel) itinerary = `[pass: ${r.passLabel}] ${itinerary}`;
     tr.innerHTML = '<td></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="num"></td><td class="tour"></td>';
     tr.children[0].textContent = r.mode;
     tr.children[1].textContent = `${r.distance.toFixed(0)} km`;

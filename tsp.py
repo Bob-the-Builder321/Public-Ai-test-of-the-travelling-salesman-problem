@@ -747,6 +747,7 @@ class ReservationLookup:
         self.night_trains = self.data.get("night_trains", [])
         self.defaults = self.data.get("defaults", {})
         self.fx = self.data.get("fx", {"EUR": 1.0})
+        self.pass_prices = self.data.get("pass_prices", {})
 
     def loaded(self) -> bool:
         return bool(self.data)
@@ -782,6 +783,29 @@ class ReservationLookup:
         return {"fee": self._eur_to(self.defaults.get("unknown_day_fee_eur", 5), currency),
                 "operator": "(unknown international)", "mandatory": False,
                 "channel_crossing": crosses_channel(a, b)}
+
+    def pick_pass(self, rail_days: int, trip_days: int, currency: str = "EUR",
+                  tier: str = "global_pass_adult_first") -> Optional[dict]:
+        """Cheapest Interrail pass that covers the trip. Returns None if nothing fits.
+        rail_days = distinct days with train travel; trip_days = total trip length.
+        """
+        prices = self.pass_prices.get(tier, {})
+        best = None
+        for f in prices.get("flexi", []):
+            if rail_days <= f["travel_days"] and trip_days <= f["within_days"]:
+                price = self._eur_to(f["price_eur"], currency)
+                if best is None or price < best["price"]:
+                    best = {"price": price, "price_eur": f["price_eur"],
+                            "kind": "flexi",
+                            "label": f"{f['travel_days']}d flexi / {f['within_days']}d window"}
+        for c in prices.get("continuous", []):
+            if trip_days <= c["duration_days"]:
+                price = self._eur_to(c["price_eur"], currency)
+                if best is None or price < best["price"]:
+                    best = {"price": price, "price_eur": c["price_eur"],
+                            "kind": "continuous",
+                            "label": f"{c['duration_days']}d continuous"}
+        return best
 
     def night_train(self, a: City, b: City, currency: str = "EUR",
                     tier: str = "couchette") -> dict:
@@ -886,6 +910,8 @@ class Schedule:
     total_days: int = 0
     stops: list = field(default_factory=list)   # [(name, arrive_date|None, depart_date|None)]
     reason: Optional[str] = None
+    pass_cost: float = 0.0                       # added to cost when an Interrail pass is bought
+    pass_label: Optional[str] = None             # e.g. "7d flexi / 30d window"
 
 
 def _stay_days(opts: ScheduleOpts, name: str) -> int:
@@ -944,6 +970,20 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
 
     total_days = max(1, math.ceil(elapsed_h / 24))
 
+    # Interrail pass cost: pick the cheapest Global Pass covering rail-days + trip-days.
+    # rail_days = number of train legs (approximation: at most one rail journey per day).
+    pass_cost = 0.0
+    pass_label: Optional[str] = None
+    if (policy and policy.interrail_pass and reservations and reservations.loaded()
+            and mode.name in ("Train", "Night train")):
+        rail_days = len(tour) if is_cycle else max(1, len(tour) - 1)
+        pick = reservations.pick_pass(rail_days, total_days, currency)
+        if pick:
+            pass_cost = pick["price"]
+            pass_label = f"{pick['label']} ({pick['price_eur']:.0f}€)"
+        else:
+            pass_label = f"no Global Pass covers {rail_days}d rail / {total_days}d trip"
+
     reason = fail_reason
     if reason is None and opts.max_days is not None and total_days > opts.max_days:
         reason = f"trip is {total_days}d, exceeds max {opts.max_days}d"
@@ -962,8 +1002,9 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
 
     return Schedule(
         feasible=(reason is None),
-        distance_km=distance, travel_h=travel_h, cost=cost,
+        distance_km=distance, travel_h=travel_h, cost=cost + pass_cost,
         total_days=total_days, stops=stops, reason=reason,
+        pass_cost=pass_cost, pass_label=pass_label,
     )
 
 
@@ -1211,8 +1252,9 @@ def report(cities: list[City], modes: list[Mode], router, prices,
             starter_str = ", ".join(f"{l['start']}->{meet.name} {l['distance']:.0f}km/{fmt_time(l['time_h']).strip()}" for l in starter_legs)
             total_starter_cost = sum(l["cost"] for l in starter_legs)
             total_cost = sched.cost + total_starter_cost
+            prefix = f"[pass: {sched.pass_label}] " if sched.pass_label else ""
             print(f"{mode.name:<12} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
-                  f"{sym}{total_cost:>9.2f} {sched.total_days:>5}d   meet at {meet.name} "
+                  f"{sym}{total_cost:>9.2f} {sched.total_days:>5}d   {prefix}meet at {meet.name} "
                   f"[{starter_str}] then {joint_names}")
             continue
         tour, result = constrained_search(cities, mode, router, prices, opts, optimise_for,
@@ -1224,6 +1266,8 @@ def report(cities: list[City], modes: list[Mode], router, prices,
         names = " -> ".join(_fmt_stop(*s) for s in sched.stops)
         if not is_open_path:
             names += f" -> {sched.stops[0][0]}"
+        if sched.pass_label:
+            names = f"[pass: {sched.pass_label}] " + names
         print(f"{mode.name:<12} {sched.distance_km:>8.0f}km {fmt_time(sched.travel_h):>10} "
               f"{sym}{sched.cost:>9.2f} {sched.total_days:>5}d   {names}")
 
