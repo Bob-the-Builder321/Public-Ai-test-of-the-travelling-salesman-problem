@@ -3,6 +3,12 @@
   "version": "2026-05",
   "source": "https://www.eurail.com/en/plan-your-trip/seat-reservations/reservation-fees",
   "currency": "EUR",
+  "included_countries": [
+    "AT", "BE", "BA", "BG", "HR", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GB", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "ME",
+    "NL", "MK", "NO", "PL", "PT", "RO", "RS", "SK", "SI", "ES",
+    "SE", "CH", "TR"
+  ],
   "fx": {
     "_comment": "Indicative rates for display only; override at runtime if you need precision.",
     "EUR": 1.0, "GBP": 0.85, "USD": 1.10, "CHF": 0.95, "CAD": 1.50,
@@ -29,7 +35,28 @@
     "Lisbon": "PT", "Porto": "PT",
     "Prague": "CZ", "Brno": "CZ",
     "Warsaw": "PL", "Krakow": "PL",
-    "Budapest": "HU"
+    "Budapest": "HU",
+    "Athens": "GR", "Thessaloniki": "GR",
+    "Sofia": "BG",
+    "Bucharest": "RO", "Cluj-Napoca": "RO",
+    "Belgrade": "RS",
+    "Tallinn": "EE",
+    "Riga": "LV",
+    "Vilnius": "LT",
+    "Bratislava": "SK",
+    "Ljubljana": "SI",
+    "Zagreb": "HR",
+    "Sarajevo": "BA",
+    "Podgorica": "ME",
+    "Skopje": "MK",
+    "Luxembourg": "LU",
+    "Istanbul": "TR", "Ankara": "TR",
+    "Reykjavik": "IS",
+    "Moscow": "RU", "Saint Petersburg": "RU",
+    "Kyiv": "UA",
+    "Minsk": "BY",
+    "Tirana": "AL",
+    "Valletta": "MT"
   },
   "domestic": {
     "_comment": "Reservation requirement for *high-speed* domestic trains. Slower regional trains nearly always don't require reservations across all countries.",

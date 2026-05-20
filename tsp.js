@@ -163,6 +163,21 @@ const LOCAL_GAZETTEER = {
   lisbon:     [38.7223, -9.1393],
   warsaw:     [52.2297, 21.0122],
   budapest:   [47.4979, 19.0402],
+  athens:     [37.9838, 23.7275],
+  istanbul:   [41.0082, 28.9784],
+  sofia:      [42.6977, 23.3219],
+  belgrade:   [44.7866, 20.4489],
+  bucharest:  [44.4268, 26.1025],
+  zagreb:     [45.8150, 15.9819],
+  ljubljana:  [46.0569, 14.5058],
+  bratislava: [48.1486, 17.1077],
+  tallinn:    [59.4370, 24.7536],
+  riga:       [56.9496, 24.1052],
+  vilnius:    [54.6872, 25.2797],
+  luxembourg: [49.6116,  6.1319],
+  reykjavik:  [64.1466, -21.9426],
+  moscow:     [55.7558, 37.6173],
+  tirana:     [41.3275, 19.8189],
   'new york': [40.7128, -74.0060],
   tokyo:      [35.6762, 139.6503],
 };
@@ -606,6 +621,13 @@ class ReservationLookup {
     this.defaults = this.data.defaults || {};
     this.fx = this.data.fx || { EUR: 1 };
     this.passPrices = this.data.pass_prices || {};
+    this.includedCountries = new Set(this.data.included_countries || []);
+  }
+
+  isCountryIncluded(code) {
+    if (!this.includedCountries.size) return true;
+    if (code == null) return true;
+    return this.includedCountries.has(code);
   }
 
   pickPass(railDays, tripDays, currency = 'EUR', tier = 'global_pass_adult_first') {
@@ -704,6 +726,16 @@ function applyPassPricing(prices, policy) {
 
 function legFeasible(mode, a, b, policy, reservations = null) {
   if (mode.name !== 'Train' && mode.name !== 'Night train') return null;
+  if (policy.interrailPass && reservations && reservations.loaded()) {
+    const ca = reservations.countryOf(a);
+    const cb = reservations.countryOf(b);
+    if (ca != null && !reservations.isCountryIncluded(ca)) {
+      return `${mode.name}: ${a.name} (${ca}) not in Interrail Global Pass area`;
+    }
+    if (cb != null && !reservations.isCountryIncluded(cb)) {
+      return `${mode.name}: ${b.name} (${cb}) not in Interrail Global Pass area`;
+    }
+  }
   let channel = false;
   if (reservations && reservations.loaded()) {
     channel = reservations.dayTrain(a, b).channelCrossing;

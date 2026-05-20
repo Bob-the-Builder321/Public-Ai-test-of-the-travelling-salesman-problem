@@ -87,6 +87,12 @@ const DEFAULT_TRAIN_POLICY = {
 const INTERRAIL_DATA = {
   fx: { EUR: 1.0, GBP: 0.85, USD: 1.10, CHF: 0.95, CAD: 1.50, AUD: 1.65, NZD: 1.80,
         JPY: 168, SEK: 11.3, NOK: 11.5, DKK: 7.45, PLN: 4.30, CZK: 25.0, HUF: 395 },
+  included_countries: [
+    'AT','BE','BA','BG','HR','CZ','DK','EE','FI','FR',
+    'DE','GB','GR','HU','IE','IT','LV','LT','LU','ME',
+    'NL','MK','NO','PL','PT','RO','RS','SK','SI','ES',
+    'SE','CH','TR',
+  ],
   city_country: {
     London: 'GB', Manchester: 'GB', Birmingham: 'GB', Edinburgh: 'GB',
     Glasgow: 'GB', Cardiff: 'GB', Bristol: 'GB', Belfast: 'GB',
@@ -105,6 +111,19 @@ const INTERRAIL_DATA = {
     Oslo: 'NO', Bergen: 'NO', Helsinki: 'FI',
     Dublin: 'IE', Lisbon: 'PT', Porto: 'PT',
     Prague: 'CZ', Brno: 'CZ', Warsaw: 'PL', Krakow: 'PL', Budapest: 'HU',
+    Athens: 'GR', Thessaloniki: 'GR',
+    Sofia: 'BG',
+    Bucharest: 'RO', 'Cluj-Napoca': 'RO',
+    Belgrade: 'RS',
+    Tallinn: 'EE', Riga: 'LV', Vilnius: 'LT',
+    Bratislava: 'SK', Ljubljana: 'SI', Zagreb: 'HR',
+    Sarajevo: 'BA', Podgorica: 'ME', Skopje: 'MK',
+    Luxembourg: 'LU',
+    Istanbul: 'TR', Ankara: 'TR',
+    Reykjavik: 'IS',
+    Moscow: 'RU', 'Saint Petersburg': 'RU',
+    Kyiv: 'UA', Minsk: 'BY',
+    Tirana: 'AL', Valletta: 'MT',
   },
   domestic: {
     FR: { fee_eur: 10, operator: 'TGV INOUI',    mandatory: true,  high_speed_only: true },
@@ -201,6 +220,13 @@ class ReservationLookup {
     this.defaults = this.data.defaults || {};
     this.fx = this.data.fx || { EUR: 1 };
     this.passPrices = this.data.pass_prices || {};
+    this.includedCountries = new Set(this.data.included_countries || []);
+  }
+
+  isCountryIncluded(code) {
+    if (!this.includedCountries.size) return true;
+    if (code == null) return true;
+    return this.includedCountries.has(code);
   }
 
   pickPass(railDays, tripDays, currency = 'EUR', tier = 'global_pass_adult_first') {
@@ -296,6 +322,16 @@ function applyPassPricing(prices, policy) {
 
 function legFeasible(mode, a, b, policy, reservations = null) {
   if (mode.name !== 'Train' && mode.name !== 'Night train') return null;
+  if (policy.interrailPass && reservations && reservations.loaded()) {
+    const ca = reservations.countryOf(a);
+    const cb = reservations.countryOf(b);
+    if (ca != null && !reservations.isCountryIncluded(ca)) {
+      return `${mode.name}: ${a.name} (${ca}) not in Interrail Global Pass area`;
+    }
+    if (cb != null && !reservations.isCountryIncluded(cb)) {
+      return `${mode.name}: ${b.name} (${cb}) not in Interrail Global Pass area`;
+    }
+  }
   let channel = false;
   if (reservations && reservations.loaded()) {
     channel = reservations.dayTrain(a, b).channelCrossing;

@@ -246,6 +246,21 @@ class LocalGazetteer:
         "lisbon":     (38.7223, -9.1393),
         "warsaw":     (52.2297, 21.0122),
         "budapest":   (47.4979, 19.0402),
+        "athens":     (37.9838, 23.7275),
+        "istanbul":   (41.0082, 28.9784),
+        "sofia":      (42.6977, 23.3219),
+        "belgrade":   (44.7866, 20.4489),
+        "bucharest":  (44.4268, 26.1025),
+        "zagreb":     (45.8150, 15.9819),
+        "ljubljana":  (46.0569, 14.5058),
+        "bratislava": (48.1486, 17.1077),
+        "tallinn":    (59.4370, 24.7536),
+        "riga":       (56.9496, 24.1052),
+        "vilnius":    (54.6872, 25.2797),
+        "luxembourg": (49.6116,  6.1319),
+        "reykjavik":  (64.1466, -21.9426),
+        "moscow":     (55.7558, 37.6173),
+        "tirana":     (41.3275, 19.8189),
         "new york":   (40.7128, -74.0060),
         "tokyo":      (35.6762, 139.6503),
     }
@@ -748,12 +763,24 @@ class ReservationLookup:
         self.defaults = self.data.get("defaults", {})
         self.fx = self.data.get("fx", {"EUR": 1.0})
         self.pass_prices = self.data.get("pass_prices", {})
+        self.included_countries = set(self.data.get("included_countries", []))
 
     def loaded(self) -> bool:
         return bool(self.data)
 
     def country_of(self, city: City) -> Optional[str]:
         return self.city_country.get(city.name)
+
+    def is_country_included(self, code: Optional[str]) -> bool:
+        """True iff the country is in the Interrail Global Pass area.
+        When we don't know the country (None), default to True so unknown
+        cities don't get spuriously rejected; users can extend city_country
+        in the JSON to enforce strictly."""
+        if not self.included_countries:
+            return True
+        if code is None:
+            return True
+        return code in self.included_countries
 
     def _eur_to(self, eur: float, currency: str) -> float:
         rate = self.fx.get(currency.upper(), self.fx.get("EUR", 1.0))
@@ -856,6 +883,15 @@ def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy,
     """Return None if the leg is allowed, else a short reason string."""
     if mode.name not in ("Train", "Night train"):
         return None
+    # Interrail Global Pass area enforcement: when the pass is active, both
+    # endpoints must be in one of the 33 included countries.
+    if policy.interrail_pass and reservations and reservations.loaded():
+        ca = reservations.country_of(a)
+        cb = reservations.country_of(b)
+        if ca is not None and not reservations.is_country_included(ca):
+            return f"{mode.name}: {a.name} ({ca}) not in Interrail Global Pass area"
+        if cb is not None and not reservations.is_country_included(cb):
+            return f"{mode.name}: {b.name} ({cb}) not in Interrail Global Pass area"
     # Eurostar opt-out — prefer the JSON's channel_crossing flag when available,
     # fall back to the lat/lon heuristic for unknown cities.
     channel = False
