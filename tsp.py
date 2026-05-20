@@ -81,8 +81,14 @@ DEFAULT_MODES: list[Mode] = [
     Mode("EV car",      1.30,  90, 0.05, 0.00, 0.00, 0.00, 0.0),
     # Coach/Train: 15 min to station, 15 min wait, 15 min from station.
     Mode("Coach",       1.35,  65, 0.04, 0.25, 0.25, 0.25, 1.0),
+    # Regular Train: per-km pricing, no pass involved.
     Mode("Train",       1.20, 120, 0.12, 0.25, 0.25, 0.25, 2.0),
-    # Night train: 30 min board (luggage + sleeper).
+    # Interrail: pass-aware mode. Per-km is 0 (pass covers it); per-leg
+    # cost is the actual reservation fee from interrail-reservations.json,
+    # plus a one-shot Global Pass cost added at the trip level.
+    Mode("Interrail",   1.20, 120, 0.00, 0.25, 0.25, 0.25, 0.0),
+    # Night train: 30 min board (luggage + sleeper). Under --interrail this
+    # becomes pass-aware too (sleeper supplement only); without, per-km.
     Mode("Night train", 1.20,  80, 0.10, 0.25, 0.50, 0.25, 30.0),
     # Flight: 45 min to/from airport, 2h security + boarding wait.
     Mode("Flight",      1.00, 700, 0.20, 0.75, 2.00, 0.75, 30.0),
@@ -700,17 +706,17 @@ def leg_cost(mode: Mode, a: City, b: City, router, prices,
         return distance, time_h, absolute
     # Default cost: per_km * distance + flat per-leg overhead.
     cost = distance * prices.per_km(mode.name) + prices.per_leg_fixed(mode.name)
-    # For Train/Night-train under an active pass, replace the flat overhead
-    # with the actual reservation/sleeper fee from the curated dataset.
-    if (policy and policy.interrail_pass and reservations and reservations.loaded()
-            and mode.name in ("Train", "Night train")):
-        cost = distance * prices.per_km(mode.name)  # likely 0 under pass pricing
-        if mode.name == "Train":
-            info = reservations.day_train(a, b, currency=currency)
-            cost += info["fee"]
-        else:  # Night train
+    # For pass-aware modes (Interrail; Night train under a pass), replace the
+    # flat overhead with the actual reservation/sleeper fee from the curated
+    # dataset.
+    if (reservations and reservations.loaded()
+            and is_pass_mode(mode.name, policy)):
+        cost = distance * prices.per_km(mode.name)  # 0 under pass pricing
+        if mode.name == "Night train":
             info = reservations.night_train(a, b, currency=currency, tier="couchette")
-            cost += info["fee"]
+        else:  # Interrail (day train)
+            info = reservations.day_train(a, b, currency=currency)
+        cost += info["fee"]
     return distance, time_h, cost
 
 
@@ -851,10 +857,29 @@ class ReservationLookup:
                 "channel_crossing": crosses_channel(a, b)}
 
 
+def is_pass_mode(mode_name: str, policy: Optional[TrainPolicy]) -> bool:
+    """A mode that uses Interrail-pass pricing + country enforcement.
+    Interrail is always pass-aware by definition; Night train is pass-aware
+    only when the user has a pass active. Regular Train is never pass-aware."""
+    if mode_name == "Interrail":
+        return True
+    if mode_name == "Night train" and policy and policy.interrail_pass:
+        return True
+    return False
+
+
+def is_rail_mode(mode_name: str) -> bool:
+    """Anything that travels on rails (used for shared physics checks)."""
+    return mode_name in ("Train", "Interrail", "Night train")
+
+
 def filter_train_modes(modes: list[Mode], policy: TrainPolicy) -> list[Mode]:
-    """Drop Train when only night trains are wanted, drop Night train when excluded."""
+    """Drop Interrail when not active; drop Train if only-night requested;
+    drop Night train per the night-trains policy."""
     out: list[Mode] = []
     for m in modes:
+        if m.name == "Interrail" and not policy.interrail_pass:
+            continue
         if m.name == "Train" and policy.night_trains == "only":
             continue
         if m.name == "Night train" and policy.night_trains == "exclude":
@@ -864,15 +889,11 @@ def filter_train_modes(modes: list[Mode], policy: TrainPolicy) -> list[Mode]:
 
 
 def apply_pass_pricing(prices, policy: TrainPolicy) -> None:
-    """Zero the per-km train fares when an Interrail pass is active. Per-leg
-    reservation / sleeper fees come from ReservationLookup at leg_cost time, so
-    we no longer hard-code them here."""
+    """Zero out Night train per-km when a pass is active (Interrail already has
+    per-km 0 baseline). Per-leg fees come from ReservationLookup at cost time."""
     if not policy.interrail_pass:
         return
     config = prices.config
-    if "Train" in config.by_name:
-        config.by_name["Train"].cost_per_km = 0.0
-        config.by_name["Train"].fixed_cost_per_leg = 0.0
     if "Night train" in config.by_name:
         config.by_name["Night train"].cost_per_km = 0.0
         config.by_name["Night train"].fixed_cost_per_leg = 0.0
@@ -881,11 +902,20 @@ def apply_pass_pricing(prices, policy: TrainPolicy) -> None:
 def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy,
                  reservations: Optional[ReservationLookup] = None) -> Optional[str]:
     """Return None if the leg is allowed, else a short reason string."""
-    if mode.name not in ("Train", "Night train"):
+    if not is_rail_mode(mode.name):
         return None
-    # Interrail Global Pass area enforcement: when the pass is active, both
-    # endpoints must be in one of the 33 included countries.
-    if policy.interrail_pass and reservations and reservations.loaded():
+    # Train (regular per-km) is never policy-gated. Distance check for night
+    # trains still applies because of the physical minimum journey length.
+    if mode.name == "Night train":
+        distance = haversine_km(a, b) * mode.detour_factor
+        if distance < policy.night_train_min_km:
+            return f"Night train: {distance:.0f}km leg shorter than {policy.night_train_min_km:.0f}km minimum"
+    if not is_pass_mode(mode.name, policy):
+        return None
+    # From here on: pass-aware modes only (Interrail; Night train under a pass).
+    # Country area enforcement: both endpoints must be in the 33 Interrail
+    # countries when the pass is in use.
+    if reservations and reservations.loaded():
         ca = reservations.country_of(a)
         cb = reservations.country_of(b)
         if ca is not None and not reservations.is_country_included(ca):
@@ -902,21 +932,16 @@ def leg_feasible(mode: Mode, a: City, b: City, policy: TrainPolicy,
         channel = crosses_channel(a, b)
     if policy.exclude_eurostar and channel:
         return f"{mode.name}: Eurostar (channel crossing) excluded"
-    if mode.name == "Train" and not policy.seat_reservations_ok:
-        # Prefer JSON's mandatory flag; fall back to distance heuristic.
+    if mode.name == "Interrail" and not policy.seat_reservations_ok:
         if reservations and reservations.loaded():
             info = reservations.day_train(a, b)
             if info.get("mandatory"):
-                return (f"Train: {a.name}->{b.name} on {info.get('operator', '')} "
+                return (f"Interrail: {a.name}->{b.name} on {info.get('operator', '')} "
                         f"needs reservation (--no-reservations set)")
         else:
             distance = haversine_km(a, b) * mode.detour_factor
             if distance >= policy.reservation_required_min_km:
-                return f"Train: {distance:.0f}km leg likely needs reservation (--no-reservations set)"
-    if mode.name == "Night train":
-        distance = haversine_km(a, b) * mode.detour_factor
-        if distance < policy.night_train_min_km:
-            return f"Night train: {distance:.0f}km leg shorter than {policy.night_train_min_km:.0f}km minimum"
+                return f"Interrail: {distance:.0f}km leg likely needs reservation (--no-reservations set)"
     return None
 
 
@@ -1010,8 +1035,8 @@ def compute_schedule(tour: list, cities: list, mode: Mode,
     # rail_days = number of train legs (approximation: at most one rail journey per day).
     pass_cost = 0.0
     pass_label: Optional[str] = None
-    if (policy and policy.interrail_pass and reservations and reservations.loaded()
-            and mode.name in ("Train", "Night train")):
+    if (reservations and reservations.loaded()
+            and is_pass_mode(mode.name, policy)):
         rail_days = len(tour) if is_cycle else max(1, len(tour) - 1)
         pick = reservations.pick_pass(rail_days, total_days, currency)
         if pick:
@@ -1420,10 +1445,12 @@ def main():
     rail = p.add_argument_group("rail policy")
     rail.add_argument("--interrail", "--interrail-pass", dest="interrail",
                       action="store_true", default=True,
-                      help="(default) treat Train + Night train as covered by an Interrail pass; "
-                           "per-km cost is 0 and reservation fees come from interrail-reservations.json")
-    rail.add_argument("--no-pass", dest="interrail", action="store_false",
-                      help="disable Interrail pass pricing; trains use the per-km fare in prices.json")
+                      help="(default) show the Interrail row alongside Train. Interrail uses "
+                           "pass pricing (0/km + reservation fees from interrail-reservations.json "
+                           "+ a Global Pass cost). Train always uses per-km pricing.")
+    rail.add_argument("--no-interrail", "--no-pass", dest="interrail", action="store_false",
+                      help="hide the Interrail row from the comparison (Train remains visible "
+                           "and per-km priced)")
     rail.add_argument("--reservations-file", default="interrail-reservations.json",
                       help="path to the curated Interrail reservations dataset")
     rail.add_argument("--exclude-eurostar", action="store_true",

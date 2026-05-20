@@ -109,10 +109,24 @@ const DEFAULT_MODES = [
   makeMode('ICE car',     1.30,  90,    0.15, 0.00, 0.00, 0.00, 0),
   makeMode('EV car',      1.30,  90,    0.05, 0.00, 0.00, 0.00, 0),
   makeMode('Coach',       1.35,  65,    0.04, 0.25, 0.25, 0.25, 1),
+  // Regular Train: per-km, no pass logic.
   makeMode('Train',       1.20, 120,    0.12, 0.25, 0.25, 0.25, 2),
+  // Interrail: pass mode. per-km 0, fees from the lookup, Global Pass cost
+  // added at trip level, country-area enforcement applies.
+  makeMode('Interrail',   1.20, 120,    0.00, 0.25, 0.25, 0.25, 0),
+  // Night train: switches between per-km (no pass) and pass-aware pricing.
   makeMode('Night train', 1.20,  80,    0.10, 0.25, 0.50, 0.25, 30),
   makeMode('Flight',      1.00, 700,    0.20, 0.75, 2.00, 0.75, 30),
 ];
+
+function isRailMode(name) {
+  return name === 'Train' || name === 'Interrail' || name === 'Night train';
+}
+function isPassMode(name, policy) {
+  if (name === 'Interrail') return true;
+  if (name === 'Night train' && policy && policy.interrailPass) return true;
+  return false;
+}
 
 const CURRENCY_SYMBOLS = {
   GBP: '£', EUR: '€', USD: '$', CAD: 'C$', AUD: 'A$', NZD: 'NZ$',
@@ -581,12 +595,11 @@ async function legCost(mode, a, b, router, prices,
   const absolute = await prices.legPrice(mode.name, a, b);
   if (absolute != null) return { distance, timeH, cost: absolute };
   let cost = distance * (await prices.perKm(mode.name)) + prices.perLegFixed(mode.name);
-  if (policy && policy.interrailPass && reservations && reservations.loaded()
-      && (mode.name === 'Train' || mode.name === 'Night train')) {
+  if (reservations && reservations.loaded() && isPassMode(mode.name, policy)) {
     cost = distance * (await prices.perKm(mode.name));
-    const info = mode.name === 'Train'
-      ? reservations.dayTrain(a, b, currency)
-      : reservations.nightTrain(a, b, currency, 'couchette');
+    const info = mode.name === 'Night train'
+      ? reservations.nightTrain(a, b, currency, 'couchette')
+      : reservations.dayTrain(a, b, currency);
     cost += info.fee;
   }
   return { distance, timeH, cost };
@@ -708,6 +721,7 @@ function crossesChannel(a, b) {
 
 function filterTrainModes(modes, policy) {
   return modes.filter((m) => {
+    if (m.name === 'Interrail' && !policy.interrailPass) return false;
     if (m.name === 'Train' && policy.nightTrains === 'only') return false;
     if (m.name === 'Night train' && policy.nightTrains === 'exclude') return false;
     return true;
@@ -715,9 +729,10 @@ function filterTrainModes(modes, policy) {
 }
 
 function applyPassPricing(prices, policy) {
+  // Interrail's defaults already have per-km 0. Train is never pass-mutated.
+  // Night train gets per-km zeroed only when the pass is active.
   if (!policy.interrailPass) return;
   const cfg = prices.config.byName;
-  if (cfg.Train) { cfg.Train.costPerKm = 0; cfg.Train.fixedCostPerLeg = 0; }
   if (cfg['Night train']) {
     cfg['Night train'].costPerKm = 0;
     cfg['Night train'].fixedCostPerLeg = 0;
@@ -725,8 +740,16 @@ function applyPassPricing(prices, policy) {
 }
 
 function legFeasible(mode, a, b, policy, reservations = null) {
-  if (mode.name !== 'Train' && mode.name !== 'Night train') return null;
-  if (policy.interrailPass && reservations && reservations.loaded()) {
+  if (!isRailMode(mode.name)) return null;
+  if (mode.name === 'Night train') {
+    const distance = haversineKm(a, b) * mode.detourFactor;
+    if (distance < policy.nightTrainMinKm) {
+      return `Night train: ${distance.toFixed(0)}km leg shorter than ${policy.nightTrainMinKm}km minimum`;
+    }
+  }
+  if (!isPassMode(mode.name, policy)) return null;
+  // Pass-aware modes only below.
+  if (reservations && reservations.loaded()) {
     const ca = reservations.countryOf(a);
     const cb = reservations.countryOf(b);
     if (ca != null && !reservations.isCountryIncluded(ca)) {
@@ -745,23 +768,17 @@ function legFeasible(mode, a, b, policy, reservations = null) {
   if (policy.excludeEurostar && channel) {
     return `${mode.name}: Eurostar (channel crossing) excluded`;
   }
-  if (mode.name === 'Train' && !policy.seatReservationsOk) {
+  if (mode.name === 'Interrail' && !policy.seatReservationsOk) {
     if (reservations && reservations.loaded()) {
       const info = reservations.dayTrain(a, b);
       if (info.mandatory) {
-        return `Train: ${a.name}->${b.name} on ${info.operator} needs reservation`;
+        return `Interrail: ${a.name}->${b.name} on ${info.operator} needs reservation`;
       }
     } else {
       const distance = haversineKm(a, b) * mode.detourFactor;
       if (distance >= policy.reservationRequiredMinKm) {
-        return `Train: ${distance.toFixed(0)}km leg likely needs reservation`;
+        return `Interrail: ${distance.toFixed(0)}km leg likely needs reservation`;
       }
-    }
-  }
-  if (mode.name === 'Night train') {
-    const distance = haversineKm(a, b) * mode.detourFactor;
-    if (distance < policy.nightTrainMinKm) {
-      return `Night train: ${distance.toFixed(0)}km leg shorter than ${policy.nightTrainMinKm}km minimum`;
     }
   }
   return null;
@@ -848,8 +865,7 @@ async function computeSchedule(tour, cities, mode, router, prices, opts, policy,
   // Interrail pass cost
   let passCost = 0;
   let passLabel = null;
-  if (policy && policy.interrailPass && reservations && reservations.loaded()
-      && (mode.name === 'Train' || mode.name === 'Night train')) {
+  if (reservations && reservations.loaded() && isPassMode(mode.name, policy)) {
     const isCycle = !((opts.endCity || '') && opts.endCity !== (opts.startCity || cities[tour[0]].name));
     const railDays = isCycle ? tour.length : Math.max(1, tour.length - 1);
     const pick = reservations.pickPass(railDays, totalDays, currency);
@@ -1200,7 +1216,7 @@ function parseArgs(argv) {
       case '--stay': out.stays.push(next()); break;
       case '--pin': out.pins.push(next()); break;
       case '--interrail': case '--interrail-pass': out.interrail = true; break;
-      case '--no-pass': out.interrail = false; break;
+      case '--no-interrail': case '--no-pass': out.interrail = false; break;
       case '--reservations-file': out.reservationsFile = next(); break;
       case '--exclude-eurostar': out.excludeEurostar = true; break;
       case '--no-reservations': out.noReservations = true; break;
